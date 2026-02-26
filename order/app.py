@@ -169,7 +169,9 @@ def checkout(order_id: str):
     app.logger.debug(f"Checkout {order_id} using mode={CHECKOUT_MODE}")
     if CHECKOUT_MODE == '2pc':
         return checkout_2pc(order_id)
-    return checkout_saga(order_id)
+    elif CHECKOUT_MODE == 'saga':
+        return checkout_saga(order_id)
+    else: abort(501, "Select a valid checkout mode.")
 
 
 def checkout_saga(order_id: str):
@@ -255,8 +257,99 @@ def checkout_saga(order_id: str):
 
 
 def checkout_2pc(order_id: str):
-    # TODO: implement 2PC here
-    abort(501, "2PC not yet implemented")
+    order_entry: OrderValue = get_order_from_db(order_id)
+
+    if order_entry.status == STATUS_PAID:
+        return Response("Checkout successful", status=200)
+    if order_entry.status in (STATUS_FAILED, STATUS_STARTED):
+        abort(400, f"Order {order_id} is in terminal/in-progress state: {order_entry.status}")
+
+    # Mark as in-progress (coordinator log — survives coordinator crash)
+    order_entry.status = STATUS_STARTED
+    try:
+        db.set(order_id, msgpack.encode(order_entry))
+    except redis.exceptions.RedisError:
+        abort(400, DB_ERROR_STR)
+
+    items_quantities: dict[str, int] = defaultdict(int)
+    for item_id, quantity in order_entry.items:
+        items_quantities[item_id] += quantity
+
+    # ── Phase 1: PREPARE ──────────────────────────────────────────────────────
+    # Ask every participant to lock resources and vote yes/no.
+    # If any votes NO, we abort everything.
+
+    prepared_stock: list[tuple[str, int]] = []
+    prepared_payment: bool = False
+
+    # Prepare stock for each item
+    for item_id, quantity in items_quantities.items():
+        reply = send_post_request(
+            # Todo: Need to element /prepare_subtract
+            f"{GATEWAY_URL}/stock/prepare_subtract/{item_id}/{quantity}"
+        )
+        if reply.status_code != 200:
+            # Participant voted NO — abort all that already prepared
+            _abort_stock(prepared_stock)
+            order_entry.status = STATUS_FAILED
+            db.set(order_id, msgpack.encode(order_entry))
+            abort(400, f"2PC prepare failed: out of stock on item {item_id}")
+        prepared_stock.append((item_id, quantity))
+
+    # Prepare payment
+    reply = send_post_request(
+        # Todo: Implement /prepare_pay
+        f"{GATEWAY_URL}/payment/prepare_pay/{order_entry.user_id}/{order_entry.total_cost}"
+    )
+    if reply.status_code != 200:
+        # Payment voted NO — abort all stock preparations
+        _abort_stock(prepared_stock)
+        order_entry.status = STATUS_FAILED
+        db.set(order_id, msgpack.encode(order_entry))
+        abort(400, "2PC prepare failed: user out of credit")
+
+    prepared_payment = True
+
+    # ── Phase 2: COMMIT ───────────────────────────────────────────────────────
+    # All participants voted YES. Durably log the COMMIT decision first,
+    # then send commit to each participant.
+    # Even if we crash here, recovery can re-send commits (idempotent).
+
+    order_entry.status = STATUS_PAID
+    order_entry.paid = True
+    try:
+        db.set(order_id, msgpack.encode(order_entry))
+    except redis.exceptions.RedisError:
+        # Failed to write commit decision — safe to abort since no participant
+        # has committed yet.
+        _abort_stock(prepared_stock)
+        if prepared_payment:
+            send_post_request(
+                # Todo: Is this not the same as add?
+                f"{GATEWAY_URL}/payment/abort_pay/{order_entry.user_id}/{order_entry.total_cost}"
+            )
+        order_entry.status = STATUS_FAILED
+        db.set(order_id, msgpack.encode(order_entry))
+        abort(400, DB_ERROR_STR)
+
+    # Send commit to all participants (best-effort; they must be idempotent)
+    for item_id, quantity in prepared_stock:
+        # Todo: Batch op?
+        send_post_request(f"{GATEWAY_URL}/stock/commit_subtract/{item_id}/{quantity}")
+
+    send_post_request(
+        f"{GATEWAY_URL}/payment/commit_pay/{order_entry.user_id}/{order_entry.total_cost}"
+    )
+
+    app.logger.debug(f"2PC checkout {order_id} committed successfully")
+    return Response("Checkout successful", status=200)
+
+
+def _abort_stock(prepared_stock: list[tuple[str, int]]):
+    """Send abort to all stock participants that successfully prepared."""
+    for item_id, quantity in prepared_stock:
+        # Todo: Implement this. Can it be a batch op instead?
+        send_post_request(f"{GATEWAY_URL}/stock/abort_subtract/{item_id}/{quantity}")
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
