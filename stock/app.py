@@ -11,6 +11,11 @@ from flask import Flask, jsonify, abort, Response
 
 DB_ERROR_STR = "DB error"
 
+# 2PC WAL state values stored in Redis
+WAL_PREPARED  = b"prepared"
+WAL_COMMITTED = b"committed"
+WAL_ABORTED   = b"aborted"
+
 app = Flask("stock-service")
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
@@ -139,6 +144,196 @@ def remove_stock(item_id: str, amount: int):
         except redis.exceptions.RedisError:
             abort(400, DB_ERROR_STR)
     abort(400, "Conflict: could not subtract stock after retries")
+
+
+# ─── 2PC Participant Endpoints ─────────────────────────────────────────────────
+#
+# Soft-reservations are stored as plain Redis integers under:
+#   reserved:stock:{item_id}
+#
+# Per-transaction WAL entries live under:
+#   2pc:stock:{order_id}:{item_id}  → b"prepared" | b"committed" | b"aborted"
+#
+# All three endpoints use WATCH/MULTI/EXEC for optimistic concurrency control so
+# multiple gunicorn workers never corrupt each other's reads and writes.
+
+def _stock_wal_key(order_id: str, item_id: str) -> str:
+    return f"2pc:stock:{order_id}:{item_id}"
+
+
+def _stock_reserved_key(item_id: str) -> str:
+    return f"reserved:stock:{item_id}"
+
+
+@app.post('/prepare_subtract/<order_id>/<item_id>/<amount>')
+def prepare_subtract(order_id: str, item_id: str, amount: int):
+    """
+    2PC Phase 1 – PREPARE (participant: stock).
+
+    Atomically checks that item_id has enough unreserved stock, then
+    soft-reserves `amount` units and records a WAL entry so the decision
+    survives participant crashes.
+
+    Idempotent: a duplicate call for the same (order_id, item_id) returns 200.
+    """
+    amount = int(amount)
+    wal_key      = _stock_wal_key(order_id, item_id)
+    reserved_key = _stock_reserved_key(item_id)
+
+    try:
+        with db.pipeline() as pipe:
+            while True:
+                try:
+                    # WATCH the three keys involved so any concurrent write
+                    # causes our EXEC to fail and we retry.
+                    pipe.watch(item_id, reserved_key, wal_key)
+
+                    # ── Idempotency check ──────────────────────────────────
+                    wal_state = pipe.get(wal_key)
+                    if wal_state in (WAL_PREPARED, WAL_COMMITTED):
+                        pipe.unwatch()
+                        return Response("Prepare: already done", status=200)
+                    if wal_state == WAL_ABORTED:
+                        pipe.unwatch()
+                        abort(400, f"Transaction {order_id} already aborted for item {item_id}")
+
+                    # ── Availability check ─────────────────────────────────
+                    raw = pipe.get(item_id)
+                    if not raw:
+                        pipe.unwatch()
+                        abort(400, f"Item: {item_id} not found!")
+                    item      = msgpack.decode(raw, type=StockValue)
+                    reserved  = int(pipe.get(reserved_key) or 0)
+                    available = item.stock - reserved
+
+                    if available < amount:
+                        pipe.unwatch()
+                        abort(400, f"Insufficient stock for item {item_id}: "
+                                   f"available={available}, requested={amount}")
+
+                    # ── Atomic soft-reserve + WAL ──────────────────────────
+                    pipe.multi()
+                    pipe.set(reserved_key, reserved + amount)
+                    pipe.set(wal_key, WAL_PREPARED)
+                    pipe.execute()
+                    break  # success
+
+                except redis.WatchError:
+                    continue  # a concurrent writer touched a watched key; retry
+
+    except redis.exceptions.RedisError:
+        abort(400, DB_ERROR_STR)
+
+    app.logger.debug(f"2PC prepare OK  order={order_id} item={item_id} qty={amount}")
+    return Response("Prepare: OK", status=200)
+
+
+@app.post('/commit_subtract/<order_id>/<item_id>/<amount>')
+def commit_subtract(order_id: str, item_id: str, amount: int):
+    """
+    2PC Phase 2 – COMMIT (participant: stock).
+
+    Permanently deducts `amount` from item stock and releases the soft-
+    reservation.  Safe to call multiple times (idempotent via WAL).
+    """
+    amount = int(amount)
+    wal_key      = _stock_wal_key(order_id, item_id)
+    reserved_key = _stock_reserved_key(item_id)
+
+    try:
+        with db.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(item_id, reserved_key, wal_key)
+
+                    wal_state = pipe.get(wal_key)
+                    if wal_state == WAL_COMMITTED:
+                        pipe.unwatch()
+                        return Response("Commit: already done", status=200)
+                    if wal_state == WAL_ABORTED:
+                        pipe.unwatch()
+                        abort(400, f"Cannot commit: transaction {order_id} was aborted for item {item_id}")
+
+                    # WAL_PREPARED (or None on coordinator recovery re-drive)
+                    raw = pipe.get(item_id)
+                    if not raw:
+                        pipe.unwatch()
+                        abort(400, f"Item: {item_id} not found!")
+                    item      = msgpack.decode(raw, type=StockValue)
+                    reserved  = int(pipe.get(reserved_key) or 0)
+
+                    new_stock    = item.stock - amount
+                    new_reserved = max(0, reserved - amount)
+
+                    if new_stock < 0:
+                        pipe.unwatch()
+                        abort(400, f"Stock underflow during commit for item {item_id}")
+
+                    item.stock = new_stock
+
+                    pipe.multi()
+                    pipe.set(item_id, msgpack.encode(item))
+                    pipe.set(reserved_key, new_reserved)
+                    pipe.set(wal_key, WAL_COMMITTED)
+                    pipe.execute()
+                    break
+
+                except redis.WatchError:
+                    continue
+
+    except redis.exceptions.RedisError:
+        abort(400, DB_ERROR_STR)
+
+    app.logger.debug(f"2PC commit OK   order={order_id} item={item_id} qty={amount}")
+    return Response("Commit: OK", status=200)
+
+
+@app.post('/abort_subtract/<order_id>/<item_id>/<amount>')
+def abort_subtract(order_id: str, item_id: str, amount: int):
+    """
+    2PC Phase 2 – ABORT (participant: stock).
+
+    Releases the soft-reservation without touching actual stock.
+    Safe to call even if prepare was never received (WAL=None → no-op).
+    Idempotent: calling twice returns 200 both times.
+    """
+    amount = int(amount)
+    wal_key      = _stock_wal_key(order_id, item_id)
+    reserved_key = _stock_reserved_key(item_id)
+
+    try:
+        with db.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(reserved_key, wal_key)
+
+                    wal_state = pipe.get(wal_key)
+                    if wal_state == WAL_ABORTED or wal_state is None:
+                        # Already aborted or never prepared — nothing to release.
+                        pipe.unwatch()
+                        return Response("Abort: already done or not prepared", status=200)
+                    if wal_state == WAL_COMMITTED:
+                        pipe.unwatch()
+                        abort(400, f"Cannot abort: transaction {order_id} already committed for item {item_id}")
+
+                    # WAL_PREPARED: release the reservation.
+                    reserved     = int(pipe.get(reserved_key) or 0)
+                    new_reserved = max(0, reserved - amount)
+
+                    pipe.multi()
+                    pipe.set(reserved_key, new_reserved)
+                    pipe.set(wal_key, WAL_ABORTED)
+                    pipe.execute()
+                    break
+
+                except redis.WatchError:
+                    continue
+
+    except redis.exceptions.RedisError:
+        abort(400, DB_ERROR_STR)
+
+    app.logger.debug(f"2PC abort OK    order={order_id} item={item_id} qty={amount}")
+    return Response("Abort: OK", status=200)
 
 
 if __name__ == '__main__':

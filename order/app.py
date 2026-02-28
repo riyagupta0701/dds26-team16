@@ -40,6 +40,11 @@ STATUS_STARTED = "started"   # checkout in progress (crash-safe marker)
 STATUS_PAID    = "paid"      # completed successfully
 STATUS_FAILED  = "failed"    # rolled back
 
+# Redis key for the coordinator WAL: a set of order_ids currently in-flight.
+# On startup, unresolved entries are used to recover hanging transactions.
+COORD_PENDING_KEY = "2pc:pending"
+
+
 class OrderValue(Struct, kw_only=True):
     paid: bool
     items: list[tuple[str, int]]
@@ -256,6 +261,25 @@ def checkout_saga(order_id: str):
     return Response("Checkout successful", status=200)
 
 
+# ─── 2PC Coordinator ──────────────────────────────────────────────────────────
+#
+# Protocol overview:
+#   Phase 1 PREPARE:  coordinator asks each participant to soft-lock resources.
+#                     If any vote NO → send ABORT to all that voted YES.
+#   Phase 2 COMMIT:   coordinator durably logs COMMIT (STATUS_PAID in its Redis)
+#                     *before* sending COMMIT to participants.  This means if
+#                     the coordinator crashes after the log write, recovery can
+#                     always re-drive the commits (participants are idempotent).
+#
+# Coordinator WAL:  a Redis SET "2pc:pending" of in-flight order_ids.
+#   • Added when the transaction starts.
+#   • Removed only after all participants have been told COMMIT or ABORT.
+#   • On startup, recover_2pc() scans this set and resolves any leftovers.
+#
+# The order_id is threaded through every participant call so participants can:
+#   • Record their own WAL entry keyed on (order_id, resource_id).
+#   • Return 200 idempotently when the same call arrives twice (retries / recovery).
+
 def checkout_2pc(order_id: str):
     order_entry: OrderValue = get_order_from_db(order_id)
 
@@ -264,10 +288,12 @@ def checkout_2pc(order_id: str):
     if order_entry.status in (STATUS_FAILED, STATUS_STARTED):
         abort(400, f"Order {order_id} is in terminal/in-progress state: {order_entry.status}")
 
-    # Mark as in-progress (coordinator log — survives coordinator crash)
+    # Mark as in-progress and register in coordinator WAL atomically enough
+    # (Redis is single-threaded; two writes in a row is fine here).
     order_entry.status = STATUS_STARTED
     try:
         db.set(order_id, msgpack.encode(order_entry))
+        db.sadd(COORD_PENDING_KEY, order_id)
     except redis.exceptions.RedisError:
         abort(400, DB_ERROR_STR)
 
@@ -277,79 +303,175 @@ def checkout_2pc(order_id: str):
 
     # ── Phase 1: PREPARE ──────────────────────────────────────────────────────
     # Ask every participant to lock resources and vote yes/no.
-    # If any votes NO, we abort everything.
+    # If any vote NO, abort everything that already prepared.
 
     prepared_stock: list[tuple[str, int]] = []
-    prepared_payment: bool = False
+    payment_prepared: bool = False
 
-    # Prepare stock for each item
     for item_id, quantity in items_quantities.items():
         reply = send_post_request(
-            # Todo: Need to element /prepare_subtract
-            f"{GATEWAY_URL}/stock/prepare_subtract/{item_id}/{quantity}"
+            f"{GATEWAY_URL}/stock/prepare_subtract/{order_id}/{item_id}/{quantity}"
         )
         if reply.status_code != 200:
-            # Participant voted NO — abort all that already prepared
-            _abort_stock(prepared_stock)
-            order_entry.status = STATUS_FAILED
-            db.set(order_id, msgpack.encode(order_entry))
+            _abort_2pc(order_id, order_entry, prepared_stock, payment_prepared)
             abort(400, f"2PC prepare failed: out of stock on item {item_id}")
         prepared_stock.append((item_id, quantity))
 
-    # Prepare payment
     reply = send_post_request(
-        # Todo: Implement /prepare_pay
-        f"{GATEWAY_URL}/payment/prepare_pay/{order_entry.user_id}/{order_entry.total_cost}"
+        f"{GATEWAY_URL}/payment/prepare_pay/{order_id}/{order_entry.user_id}/{order_entry.total_cost}"
     )
     if reply.status_code != 200:
-        # Payment voted NO — abort all stock preparations
-        _abort_stock(prepared_stock)
-        order_entry.status = STATUS_FAILED
-        db.set(order_id, msgpack.encode(order_entry))
+        _abort_2pc(order_id, order_entry, prepared_stock, payment_prepared)
         abort(400, "2PC prepare failed: user out of credit")
 
-    prepared_payment = True
+    payment_prepared = True
 
     # ── Phase 2: COMMIT ───────────────────────────────────────────────────────
-    # All participants voted YES. Durably log the COMMIT decision first,
-    # then send commit to each participant.
-    # Even if we crash here, recovery can re-send commits (idempotent).
+    # Durably log the COMMIT decision *first*.  Once STATUS_PAID is persisted,
+    # we are past the point of no return: recovery will re-drive commits even
+    # if we crash before reaching all participants.
 
     order_entry.status = STATUS_PAID
-    order_entry.paid = True
+    order_entry.paid   = True
     try:
         db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
-        # Failed to write commit decision — safe to abort since no participant
-        # has committed yet.
-        _abort_stock(prepared_stock)
-        if prepared_payment:
-            send_post_request(
-                # Todo: Is this not the same as add?
-                f"{GATEWAY_URL}/payment/abort_pay/{order_entry.user_id}/{order_entry.total_cost}"
-            )
-        order_entry.status = STATUS_FAILED
-        db.set(order_id, msgpack.encode(order_entry))
+        # Failed to write commit decision — still safe to abort because no
+        # participant has committed yet.
+        _abort_2pc(order_id, order_entry, prepared_stock, payment_prepared)
         abort(400, DB_ERROR_STR)
 
-    # Send commit to all participants (best-effort; they must be idempotent)
+    # Send COMMIT to all participants (idempotent on their end).
     for item_id, quantity in prepared_stock:
-        # Todo: Batch op?
-        send_post_request(f"{GATEWAY_URL}/stock/commit_subtract/{item_id}/{quantity}")
+        send_post_request(f"{GATEWAY_URL}/stock/commit_subtract/{order_id}/{item_id}/{quantity}")
 
     send_post_request(
-        f"{GATEWAY_URL}/payment/commit_pay/{order_entry.user_id}/{order_entry.total_cost}"
+        f"{GATEWAY_URL}/payment/commit_pay/{order_id}/{order_entry.user_id}/{order_entry.total_cost}"
     )
+
+    # All commits sent — remove from coordinator WAL.
+    db.srem(COORD_PENDING_KEY, order_id)
 
     app.logger.debug(f"2PC checkout {order_id} committed successfully")
     return Response("Checkout successful", status=200)
 
 
-def _abort_stock(prepared_stock: list[tuple[str, int]]):
-    """Send abort to all stock participants that successfully prepared."""
+def _abort_2pc(
+    order_id: str,
+    order_entry: OrderValue,
+    prepared_stock: list[tuple[str, int]],
+    payment_prepared: bool,
+):
+    """
+    Send ABORT to every participant that has voted YES, then mark the order
+    as FAILED and remove it from the coordinator WAL.
+    Abort endpoints are idempotent, so duplicate calls are harmless.
+    """
     for item_id, quantity in prepared_stock:
-        # Todo: Implement this. Can it be a batch op instead?
-        send_post_request(f"{GATEWAY_URL}/stock/abort_subtract/{item_id}/{quantity}")
+        send_post_request(
+            f"{GATEWAY_URL}/stock/abort_subtract/{order_id}/{item_id}/{quantity}"
+        )
+    if payment_prepared:
+        send_post_request(
+            f"{GATEWAY_URL}/payment/abort_pay/{order_id}/{order_entry.user_id}/{order_entry.total_cost}"
+        )
+    order_entry.status = STATUS_FAILED
+    try:
+        db.set(order_id, msgpack.encode(order_entry))
+    except redis.exceptions.RedisError:
+        app.logger.error(f"Failed to persist FAILED status for order {order_id}")
+    db.srem(COORD_PENDING_KEY, order_id)
+
+
+# ─── Coordinator Recovery ─────────────────────────────────────────────────────
+#
+# Called once at module load time (i.e. once per gunicorn worker process).
+# Scans the coordinator WAL for any orders that were in-flight when a previous
+# coordinator instance crashed, then resolves them deterministically:
+#
+#   STATUS_PAID    → commit decision was already logged; re-drive all COMMITs.
+#   anything else  → coordinator crashed during PREPARE; safe to ABORT everyone.
+#
+# Because participant endpoints are idempotent, it is safe for multiple workers
+# to run recovery concurrently for the same order.
+
+def _recovery_post(url: str):
+    """Best-effort POST used during recovery (no Flask request context)."""
+    try:
+        requests.post(url, timeout=5)
+    except Exception as exc:
+        app.logger.warning(f"Recovery POST failed {url}: {exc}")
+
+
+def recover_2pc():
+    try:
+        pending = db.smembers(COORD_PENDING_KEY)
+    except redis.exceptions.RedisError as exc:
+        app.logger.error(f"Recovery: cannot read coordinator WAL: {exc}")
+        return
+
+    if not pending:
+        return
+
+    app.logger.info(f"Recovery: found {len(pending)} in-flight 2PC transaction(s)")
+
+    for order_id_bytes in pending:
+        order_id = order_id_bytes.decode()
+        try:
+            raw = db.get(order_id)
+            if not raw:
+                app.logger.warning(f"Recovery: order {order_id} not found in DB — removing from WAL")
+                db.srem(COORD_PENDING_KEY, order_id)
+                continue
+            order = msgpack.decode(raw, type=OrderValue)
+        except Exception as exc:
+            app.logger.error(f"Recovery: failed to read order {order_id}: {exc}")
+            continue
+
+        items_quantities: dict[str, int] = defaultdict(int)
+        for item_id, quantity in order.items:
+            items_quantities[item_id] += quantity
+
+        if order.status == STATUS_PAID:
+            # Commit decision was durably logged; re-drive COMMITs to all participants.
+            app.logger.info(f"Recovery: re-driving COMMIT for order {order_id}")
+            for item_id, quantity in items_quantities.items():
+                _recovery_post(
+                    f"{GATEWAY_URL}/stock/commit_subtract/{order_id}/{item_id}/{quantity}"
+                )
+            _recovery_post(
+                f"{GATEWAY_URL}/payment/commit_pay/{order_id}/{order.user_id}/{order.total_cost}"
+            )
+        else:
+            # STATUS_STARTED (or any unexpected state): coordinator crashed
+            # before writing the commit decision.  Abort all participants.
+            # Abort is safe even for participants that never received PREPARE.
+            app.logger.info(f"Recovery: re-driving ABORT for order {order_id} (status={order.status})")
+            for item_id, quantity in items_quantities.items():
+                _recovery_post(
+                    f"{GATEWAY_URL}/stock/abort_subtract/{order_id}/{item_id}/{quantity}"
+                )
+            _recovery_post(
+                f"{GATEWAY_URL}/payment/abort_pay/{order_id}/{order.user_id}/{order.total_cost}"
+            )
+            order.status = STATUS_FAILED
+            try:
+                db.set(order_id, msgpack.encode(order))
+            except redis.exceptions.RedisError:
+                app.logger.error(f"Recovery: failed to persist FAILED for order {order_id}")
+
+        db.srem(COORD_PENDING_KEY, order_id)
+
+    app.logger.info("Recovery: complete")
+
+
+# Run recovery when the module is loaded by gunicorn (once per worker process).
+try:
+    recover_2pc()
+except Exception as exc:
+    # Never crash the worker on startup failure — log and continue.
+    app.logger.error(f"Recovery failed at startup: {exc}")
+
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
