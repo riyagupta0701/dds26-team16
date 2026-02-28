@@ -1,3 +1,11 @@
+# =============================================================================
+# ORDER SERVICE — Kubernetes Manifests
+# =============================================================================
+# The order service is the transaction COORDINATOR. It is the entry point for
+# checkouts and will orchestrate either a Saga or 2PC across the stock and
+# payment services (depending on the PROTOCOL env var).
+# =============================================================================
+
 apiVersion: v1
 kind: Service
 metadata:
@@ -10,7 +18,9 @@ spec:
     - port: 5000
       name: http
       targetPort: 5000
+
 ---
+
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -20,6 +30,11 @@ spec:
   selector:
     matchLabels:
       component: order
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   template:
     metadata:
       labels:
@@ -29,25 +44,39 @@ spec:
         - name: order
           image: order:latest
           resources:
-            limits:
-              memory: "1Gi"
-              cpu: "1"
             requests:
-              memory: "1Gi"
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
               cpu: "1"
           command: ["gunicorn"]
-          args: ["-b", "0.0.0.0:5000", "app:app"]
+          args: ["-b", "0.0.0.0:5000", "-w", "2", "--timeout", "30",
+                 "--log-level", "info", "app:app"]
           ports:
             - containerPort: 5000
+          readinessProbe:
+            tcpSocket:
+              port: 5000
+            initialDelaySeconds: 5 
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+
           env:
-            - name: USER_SERVICE_URL
-              value: "user-service"
-            - name: STOCK_SERVICE_URL
-              value: "stock-service"
+            - name: PROTOCOL
+              value: "saga"          # Which protocol to use: "saga" or "2pc"
+            - name: GATEWAY_URL
+              value: "http://gateway:80"
             - name: REDIS_HOST
-              value: redis-master
+              value: "redis-master"
             - name: REDIS_PORT
-              value: '6379'
+              value: "6379"
             - name: REDIS_PASSWORD
               value: "redis"
             - name: REDIS_DB

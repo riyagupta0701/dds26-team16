@@ -1,5 +1,20 @@
+# =============================================================================
+# Redis Helm Chart Values (bitnami/redis)
+# =============================================================================
+# Shared Redis instance (1 master + 1 replica) with AOF persistence enabled.
+# Each service uses a separate logical database to avoid key collisions:
+#   order=DB0, stock=DB1, payment=DB2
+# =============================================================================
+
 auth:
   password: redis
+
+# appendonly enable: AOF persistence (survives container restart)
+# appendfsync everysec: flush to disk once per second (max 1s data loss)
+commonConfiguration: |-
+  appendonly yes
+  appendfsync everysec
+
 master:
   persistence:
     size: 4Gi
@@ -7,6 +22,7 @@ master:
     requests:
       memory: 4Gi
       cpu: 2
+
 replica:
   replicaCount: 1
   persistence:

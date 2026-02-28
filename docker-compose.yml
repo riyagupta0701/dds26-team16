@@ -17,6 +17,7 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+      - PROTOCOL=saga
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
@@ -25,7 +26,9 @@ services:
 
   order-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec
+    volumes:
+      - order-db-data:/data
 
   stock-service:
     build: ./stock
@@ -38,7 +41,9 @@ services:
 
   stock-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec
+    volumes:
+      - stock-db-data:/data
 
   payment-service:
     build: ./payment
@@ -51,4 +56,11 @@ services:
 
   payment-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec
+    volumes:
+      - payment-db-data:/data
+
+volumes:
+  order-db-data:
+  stock-db-data:
+  payment-db-data:
