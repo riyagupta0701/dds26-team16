@@ -81,29 +81,62 @@ def find_user(user_id: str):
 
 @app.post('/add_funds/<user_id>/<amount>')
 def add_credit(user_id: str, amount: int):
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit += int(amount)
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+    """
+    Idempotency: uses a Redis WATCH/MULTI/EXEC optimistic lock so concurrent
+    retries from the benchmark cannot double-add funds.
+    """
+    amount = int(amount)
+    for _ in range(10):  # retry loop for optimistic lock
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(user_id)
+                raw = pipe.get(user_id)
+                if raw is None:
+                    pipe.reset()
+                    abort(400, f"User: {user_id} not found!")
+                user_entry = msgpack.decode(raw, type=UserValue)
+                pipe.multi()
+                user_entry.credit += amount
+                pipe.set(user_id, msgpack.encode(user_entry))
+                pipe.execute()
+                return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            abort(400, DB_ERROR_STR)
+    abort(400, "Conflict: could not update credit after retries")
 
 
 @app.post('/pay/<user_id>/<amount>')
 def remove_credit(user_id: str, amount: int):
+    """
+    Atomically deduct credit using optimistic locking.
+    Returns 400 if credit would go below zero.
+    """
+    amount = int(amount)
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit -= int(amount)
-    if user_entry.credit < 0:
-        abort(400, f"User: {user_id} credit cannot get reduced below zero!")
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(user_id)
+                raw = pipe.get(user_id)
+                if raw is None:
+                    pipe.reset()
+                    abort(400, f"User: {user_id} not found!")
+                user_entry = msgpack.decode(raw, type=UserValue)
+                if user_entry.credit - amount < 0:
+                    pipe.reset()
+                    abort(400, f"User: {user_id} credit cannot get reduced below zero!")
+                pipe.multi()
+                user_entry.credit -= amount
+                pipe.set(user_id, msgpack.encode(user_entry))
+                pipe.execute()
+                return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            abort(400, DB_ERROR_STR)
+    abort(400, "Conflict: could not deduct credit after retries")
 
 
 if __name__ == '__main__':

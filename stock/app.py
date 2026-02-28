@@ -84,29 +84,61 @@ def find_item(item_id: str):
 
 @app.post('/add/<item_id>/<amount>')
 def add_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock += int(amount)
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+    """
+    Atomically add stock using optimistic locking.
+    """
+    amount = int(amount)
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(item_id)
+                raw = pipe.get(item_id)
+                if raw is None:
+                    pipe.reset()
+                    abort(400, f"Item: {item_id} not found!")
+                item_entry = msgpack.decode(raw, type=StockValue)
+                pipe.multi()
+                item_entry.stock += amount
+                pipe.set(item_id, msgpack.encode(item_entry))
+                pipe.execute()
+                return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            abort(400, DB_ERROR_STR)
+    abort(400, "Conflict: could not update stock after retries")
 
 
 @app.post('/subtract/<item_id>/<amount>')
 def remove_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock -= int(amount)
-    app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
-    if item_entry.stock < 0:
-        abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+    """
+    Atomically subtract stock using optimistic locking.
+    Returns 400 if stock would go below zero.
+    """
+    amount = int(amount)
+    app.logger.debug(f"Subtracting {amount} from item: {item_id}")
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(item_id)
+                raw = pipe.get(item_id)
+                if raw is None:
+                    pipe.reset()
+                    abort(400, f"Item: {item_id} not found!")
+                item_entry = msgpack.decode(raw, type=StockValue)
+                if item_entry.stock - amount < 0:
+                    pipe.reset()
+                    abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
+                pipe.multi()
+                item_entry.stock -= amount
+                pipe.set(item_id, msgpack.encode(item_entry))
+                pipe.execute()
+                return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            abort(400, DB_ERROR_STR)
+    abort(400, "Conflict: could not subtract stock after retries")
 
 
 if __name__ == '__main__':
