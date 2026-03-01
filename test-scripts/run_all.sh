@@ -68,6 +68,9 @@ run_test "$SCRIPT_DIR/03_compensation_payment_fails.sh"
 run_test "$SCRIPT_DIR/04_compensation_stock_fails.sh"
 run_test "$SCRIPT_DIR/08_consistency_check.sh"
 
+# 2PC participant protocol (no container restart required)
+run_test "$SCRIPT_DIR/09_2pc_protocol.sh"
+
 # Fault tolerance tests (stop/start containers — slower)
 if [ "${SKIP_FAULT_TESTS:-0}" != "1" ]; then
   run_test "$SCRIPT_DIR/05_fault_app_replica.sh"
@@ -77,7 +80,7 @@ else
   echo -e "${YELLOW}→  Skipping fault tests (SKIP_FAULT_TESTS=1)${RESET}"
 fi
 
-# Mode flag test
+# Mode flag test — switches CHECKOUT_MODE between saga and 2pc (restarts order services)
 run_test "$SCRIPT_DIR/07_mode_flag.sh"
 
 # Final summary
