@@ -164,8 +164,11 @@ def add_item(order_id: str, item_id: str, quantity: int):
 
 
 def rollback_stock(removed_items: list[tuple[str, int]]):
+    # Best-effort: use _recovery_post so a network hiccup during compensation
+    # does not raise an HTTPException that would prevent STATUS_FAILED from
+    # being persisted by the caller.
     for item_id, quantity in removed_items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
+        _recovery_post(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
 
 
 # Checkout dispatcher
@@ -246,8 +249,10 @@ def checkout_saga(order_id: str):
     try:
         db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
-        # Backward: Refund Payment then Release Stock
-        send_post_request(f"{GATEWAY_URL}/payment/add_funds/{order_entry.user_id}/{order_entry.total_cost}")
+        # Backward: Refund Payment then Release Stock.
+        # Use _recovery_post so a network error here doesn't abort() and skip
+        # the STATUS_FAILED write below.
+        _recovery_post(f"{GATEWAY_URL}/payment/add_funds/{order_entry.user_id}/{order_entry.total_cost}")
         rollback_stock(removed_items)
         order_entry.paid = False
         order_entry.status = STATUS_FAILED
@@ -288,12 +293,16 @@ def checkout_2pc(order_id: str):
     if order_entry.status in (STATUS_FAILED, STATUS_STARTED):
         abort(400, f"Order {order_id} is in terminal/in-progress state: {order_entry.status}")
 
-    # Mark as in-progress and register in coordinator WAL atomically enough
-    # (Redis is single-threaded; two writes in a row is fine here).
+    # Mark as in-progress AND register in the coordinator WAL atomically.
+    # Using a pipeline (MULTI/EXEC) so a crash between the two writes cannot
+    # leave the order in STATUS_STARTED without a WAL entry — which would
+    # strand it forever because recovery only looks at the WAL.
     order_entry.status = STATUS_STARTED
     try:
-        db.set(order_id, msgpack.encode(order_entry))
-        db.sadd(COORD_PENDING_KEY, order_id)
+        with db.pipeline(transaction=True) as pipe:
+            pipe.set(order_id, msgpack.encode(order_entry))
+            pipe.sadd(COORD_PENDING_KEY, order_id)
+            pipe.execute()
     except redis.exceptions.RedisError:
         abort(400, DB_ERROR_STR)
 
@@ -342,15 +351,26 @@ def checkout_2pc(order_id: str):
         abort(400, DB_ERROR_STR)
 
     # Send COMMIT to all participants (idempotent on their end).
+    # Use best-effort sends: STATUS_PAID is already durable, so the client
+    # always gets 200 regardless of delivery.  If a send fails, the order stays
+    # in the coordinator WAL and recover_2pc() re-drives commits on next startup.
+    all_committed = True
     for item_id, quantity in prepared_stock:
-        send_post_request(f"{GATEWAY_URL}/stock/commit_subtract/{order_id}/{item_id}/{quantity}")
+        if not _recovery_post(f"{GATEWAY_URL}/stock/commit_subtract/{order_id}/{item_id}/{quantity}"):
+            all_committed = False
 
-    send_post_request(
+    if not _recovery_post(
         f"{GATEWAY_URL}/payment/commit_pay/{order_id}/{order_entry.user_id}/{order_entry.total_cost}"
-    )
+    ):
+        all_committed = False
 
-    # All commits sent — remove from coordinator WAL.
-    db.srem(COORD_PENDING_KEY, order_id)
+    if all_committed:
+        try:
+            db.srem(COORD_PENDING_KEY, order_id)
+        except redis.exceptions.RedisError:
+            # Non-fatal: recovery will find STATUS_PAID and re-drive commits
+            # (idempotent), then clean up the WAL entry.
+            app.logger.warning(f"Could not remove order {order_id} from coordinator WAL")
 
     app.logger.debug(f"2PC checkout {order_id} committed successfully")
     return Response("Checkout successful", status=200)
@@ -363,24 +383,40 @@ def _abort_2pc(
     payment_prepared: bool,
 ):
     """
-    Send ABORT to every participant that has voted YES, then mark the order
-    as FAILED and remove it from the coordinator WAL.
-    Abort endpoints are idempotent, so duplicate calls are harmless.
+    Send ABORT to every participant that voted YES, then mark the order FAILED.
+
+    Uses best-effort sends (_recovery_post) so a network error never raises an
+    HTTPException that would skip persisting STATUS_FAILED or prevent the caller
+    from returning the correct error to the client.
+
+    WAL removal strategy: only remove from coordinator WAL when every abort was
+    delivered successfully.  If any send fails, the order stays in the WAL so
+    recover_2pc() can re-drive aborts on the next startup.
     """
+    all_aborted = True
     for item_id, quantity in prepared_stock:
-        send_post_request(
+        if not _recovery_post(
             f"{GATEWAY_URL}/stock/abort_subtract/{order_id}/{item_id}/{quantity}"
-        )
+        ):
+            all_aborted = False
+
     if payment_prepared:
-        send_post_request(
+        if not _recovery_post(
             f"{GATEWAY_URL}/payment/abort_pay/{order_id}/{order_entry.user_id}/{order_entry.total_cost}"
-        )
+        ):
+            all_aborted = False
+
     order_entry.status = STATUS_FAILED
     try:
         db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
         app.logger.error(f"Failed to persist FAILED status for order {order_id}")
-    db.srem(COORD_PENDING_KEY, order_id)
+
+    if all_aborted:
+        try:
+            db.srem(COORD_PENDING_KEY, order_id)
+        except redis.exceptions.RedisError:
+            app.logger.warning(f"Could not remove order {order_id} from coordinator WAL")
 
 
 # ─── Coordinator Recovery ─────────────────────────────────────────────────────
@@ -395,12 +431,19 @@ def _abort_2pc(
 # Because participant endpoints are idempotent, it is safe for multiple workers
 # to run recovery concurrently for the same order.
 
-def _recovery_post(url: str):
-    """Best-effort POST used during recovery (no Flask request context)."""
-    try:
-        requests.post(url, timeout=5)
-    except Exception as exc:
-        app.logger.warning(f"Recovery POST failed {url}: {exc}")
+def _recovery_post(url: str) -> bool:
+    """
+    Best-effort POST with retries.  Returns True only when a 200 response is
+    received.  Never raises — callers use the return value to decide whether
+    to keep the order in the coordinator WAL for the next recovery pass.
+    """
+    for _ in range(3):
+        try:
+            resp = requests.post(url, timeout=5)
+            return resp.status_code == 200
+        except Exception as exc:
+            app.logger.warning(f"POST failed {url}: {exc}")
+    return False
 
 
 def recover_2pc():
@@ -435,47 +478,73 @@ def recover_2pc():
         if order.status == STATUS_PAID:
             # Commit decision was durably logged; re-drive COMMITs to all participants.
             app.logger.info(f"Recovery: re-driving COMMIT for order {order_id}")
+            all_committed = True
             for item_id, quantity in items_quantities.items():
-                _recovery_post(
+                if not _recovery_post(
                     f"{GATEWAY_URL}/stock/commit_subtract/{order_id}/{item_id}/{quantity}"
-                )
-            _recovery_post(
+                ):
+                    all_committed = False
+            if not _recovery_post(
                 f"{GATEWAY_URL}/payment/commit_pay/{order_id}/{order.user_id}/{order.total_cost}"
-            )
+            ):
+                all_committed = False
+
+            if all_committed:
+                try:
+                    db.srem(COORD_PENDING_KEY, order_id)
+                except redis.exceptions.RedisError:
+                    app.logger.warning(f"Recovery: could not remove {order_id} from WAL")
+            # else: leave in WAL; next recovery pass will retry commits.
+
         else:
             # STATUS_STARTED (or any unexpected state): coordinator crashed
             # before writing the commit decision.  Abort all participants.
             # Abort is safe even for participants that never received PREPARE.
             app.logger.info(f"Recovery: re-driving ABORT for order {order_id} (status={order.status})")
+            all_aborted = True
             for item_id, quantity in items_quantities.items():
-                _recovery_post(
+                if not _recovery_post(
                     f"{GATEWAY_URL}/stock/abort_subtract/{order_id}/{item_id}/{quantity}"
-                )
-            _recovery_post(
+                ):
+                    all_aborted = False
+            if not _recovery_post(
                 f"{GATEWAY_URL}/payment/abort_pay/{order_id}/{order.user_id}/{order.total_cost}"
-            )
+            ):
+                all_aborted = False
+
             order.status = STATUS_FAILED
+            status_saved = False
             try:
                 db.set(order_id, msgpack.encode(order))
+                status_saved = True
             except redis.exceptions.RedisError:
                 app.logger.error(f"Recovery: failed to persist FAILED for order {order_id}")
 
-        db.srem(COORD_PENDING_KEY, order_id)
+            # Only remove from WAL when both the status write and all abort
+            # sends succeeded.  Otherwise leave it for the next recovery pass.
+            if all_aborted and status_saved:
+                try:
+                    db.srem(COORD_PENDING_KEY, order_id)
+                except redis.exceptions.RedisError:
+                    app.logger.warning(f"Recovery: could not remove {order_id} from WAL")
 
     app.logger.info("Recovery: complete")
 
 
-# Run recovery when the module is loaded by gunicorn (once per worker process).
-try:
-    recover_2pc()
-except Exception as exc:
-    # Never crash the worker on startup failure — log and continue.
-    app.logger.error(f"Recovery failed at startup: {exc}")
+def _run_recovery():
+    """Run 2PC recovery; never raises so a startup failure cannot kill the worker."""
+    try:
+        recover_2pc()
+    except Exception as exc:
+        app.logger.error(f"Recovery failed at startup: {exc}")
 
 
 if __name__ == '__main__':
+    _run_recovery()
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
+    # Configure logging first so recover_2pc() log output goes to gunicorn.
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
+    _run_recovery()

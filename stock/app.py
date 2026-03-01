@@ -118,21 +118,25 @@ def add_stock(item_id: str, amount: int):
 def remove_stock(item_id: str, amount: int):
     """
     Atomically subtract stock using optimistic locking.
-    Returns 400 if stock would go below zero.
+    Respects 2PC soft-reservations: only unreserved stock may be subtracted.
+    Returns 400 if stock would fall below the currently reserved amount.
     """
     amount = int(amount)
     app.logger.debug(f"Subtracting {amount} from item: {item_id}")
+    reserved_key = _stock_reserved_key(item_id)
     for _ in range(10):
         try:
             with db.pipeline() as pipe:
-                pipe.watch(item_id)
+                pipe.watch(item_id, reserved_key)
                 raw = pipe.get(item_id)
                 if raw is None:
-                    pipe.reset()
+                    pipe.unwatch()
                     abort(400, f"Item: {item_id} not found!")
                 item_entry = msgpack.decode(raw, type=StockValue)
-                if item_entry.stock - amount < 0:
-                    pipe.reset()
+                reserved  = int(pipe.get(reserved_key) or 0)
+                # Guard: cannot subtract below what is already soft-reserved.
+                if item_entry.stock - amount < reserved:
+                    pipe.unwatch()
                     abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
                 pipe.multi()
                 item_entry.stock -= amount
@@ -266,8 +270,15 @@ def commit_subtract(order_id: str, item_id: str, amount: int):
                     new_reserved = max(0, reserved - amount)
 
                     if new_stock < 0:
-                        pipe.unwatch()
-                        abort(400, f"Stock underflow during commit for item {item_id}")
+                        # The coordinator has already durably logged COMMIT, so
+                        # we must commit regardless.  This path should be
+                        # unreachable now that /subtract checks reservations, but
+                        # if something bypassed the reservation, log and proceed.
+                        app.logger.error(
+                            f"2PC commit: stock underflow for item {item_id} order {order_id} "
+                            f"(stock={item.stock}, reserved={reserved}, amount={amount}). "
+                            f"Committing anyway to preserve 2PC durability."
+                        )
 
                     item.stock = new_stock
 

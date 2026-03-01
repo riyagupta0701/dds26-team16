@@ -115,21 +115,25 @@ def add_credit(user_id: str, amount: int):
 def remove_credit(user_id: str, amount: int):
     """
     Atomically deduct credit using optimistic locking.
-    Returns 400 if credit would go below zero.
+    Respects 2PC soft-reservations: only unreserved credit may be deducted.
+    Returns 400 if credit would fall below the currently reserved amount.
     """
     amount = int(amount)
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
+    reserved_key = _payment_reserved_key(user_id)
     for _ in range(10):
         try:
             with db.pipeline() as pipe:
-                pipe.watch(user_id)
+                pipe.watch(user_id, reserved_key)
                 raw = pipe.get(user_id)
                 if raw is None:
-                    pipe.reset()
+                    pipe.unwatch()
                     abort(400, f"User: {user_id} not found!")
                 user_entry = msgpack.decode(raw, type=UserValue)
-                if user_entry.credit - amount < 0:
-                    pipe.reset()
+                reserved   = int(pipe.get(reserved_key) or 0)
+                # Guard: cannot deduct below what is already soft-reserved.
+                if user_entry.credit - amount < reserved:
+                    pipe.unwatch()
                     abort(400, f"User: {user_id} credit cannot get reduced below zero!")
                 pipe.multi()
                 user_entry.credit -= amount
@@ -260,8 +264,15 @@ def commit_pay(order_id: str, user_id: str, amount: int):
                     new_reserved = max(0, reserved - amount)
 
                     if new_credit < 0:
-                        pipe.unwatch()
-                        abort(400, f"Credit underflow during commit for user {user_id}")
+                        # The coordinator has already durably logged COMMIT, so
+                        # we must commit regardless.  This path should be
+                        # unreachable now that /pay checks reservations, but if
+                        # something bypassed the reservation, log and proceed.
+                        app.logger.error(
+                            f"2PC commit: credit underflow for user {user_id} order {order_id} "
+                            f"(credit={user.credit}, reserved={reserved}, amount={amount}). "
+                            f"Committing anyway to preserve 2PC durability."
+                        )
 
                     user.credit = new_credit
 
