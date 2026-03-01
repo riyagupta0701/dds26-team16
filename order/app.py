@@ -10,7 +10,7 @@ import requests
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
-
+from requests import Response
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -63,6 +63,7 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
     # deserialize data if it exists else return null
     entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if entry is None:
+        app.logger.warning("Order entry not found: %s", order_id)
         # if order does not exist in the database; abort
         abort(400, f"Order: {order_id} not found!")
     return entry
@@ -71,6 +72,7 @@ def save_order(order_id: str, order: OrderValue):
     try:
         db.set(order_id, msgpack.encode(order))
     except redis.exceptions.RedisError:
+        app.logger.error("Failed to save order: %s", order_id)
         abort(400, DB_ERROR_STR)
 
 
@@ -82,6 +84,7 @@ def create_order(user_id: str):
     try:
         db.set(key, value)
     except redis.exceptions.RedisError:
+        app.logger.error("Failed to save order: %s", key)
         return abort(400, DB_ERROR_STR)
     return jsonify({'order_id': key})
 
@@ -109,6 +112,7 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     try:
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
+        app.logger.error("Failed to save order: %s", kv_pairs)
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
 
@@ -128,7 +132,7 @@ def find_order(order_id: str):
     )
 
 # HTTP helpers with retry
-def send_post_request(url: str, retries: int = 3) -> requests.Response:
+def send_post_request(url: str, retries: int = 3) -> Response | None:
     for attempt in range(retries):
         try:
             response = requests.post(url, timeout=5)
@@ -136,9 +140,9 @@ def send_post_request(url: str, retries: int = 3) -> requests.Response:
         except requests.exceptions.RequestException:
             if attempt == retries - 1:
                 abort(400, REQ_ERROR_STR)
+    return None
 
-
-def send_get_request(url: str, retries: int = 3) -> requests.Response:
+def send_get_request(url: str, retries: int = 3) -> Response | None:
     for attempt in range(retries):
         try:
             response = requests.get(url, timeout=5)
@@ -146,6 +150,7 @@ def send_get_request(url: str, retries: int = 3) -> requests.Response:
         except requests.exceptions.RequestException:
             if attempt == retries - 1:
                 abort(400, REQ_ERROR_STR)
+    return None
 
 
 @app.post('/addItem/<order_id>/<item_id>/<quantity>')
