@@ -10,7 +10,6 @@ import requests
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
-from requests import Response
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -132,7 +131,7 @@ def find_order(order_id: str):
     )
 
 # HTTP helpers with retry
-def send_post_request(url: str, retries: int = 3) -> Response | None:
+def send_post_request(url: str, retries: int = 3) -> requests.Response | None:
     for attempt in range(retries):
         try:
             response = requests.post(url, timeout=5)
@@ -142,7 +141,7 @@ def send_post_request(url: str, retries: int = 3) -> Response | None:
                 abort(400, REQ_ERROR_STR)
     return None
 
-def send_get_request(url: str, retries: int = 3) -> Response | None:
+def send_get_request(url: str, retries: int = 3) -> requests.Response | None:
     for attempt in range(retries):
         try:
             response = requests.get(url, timeout=5)
