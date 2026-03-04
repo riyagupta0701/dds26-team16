@@ -134,7 +134,8 @@ def remove_credit(user_id: str, amount: int):
                 # Guard: cannot deduct below what is already soft-reserved.
                 if user_entry.credit - amount < reserved:
                     pipe.unwatch()
-                    abort(400, f"User: {user_id} credit cannot get reduced below zero!")
+                    abort(400, f"Insufficient available credit for user '{user_id}'. Requested deduction: {amount}, reserved: {reserved}, current balance: {user_entry.credit}."
+                    )
                 pipe.multi()
                 user_entry.credit -= amount
                 pipe.set(user_id, msgpack.encode(user_entry))
