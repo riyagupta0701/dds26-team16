@@ -290,23 +290,41 @@ def checkout_saga(order_id: str):
 #   • Return 200 idempotently when the same call arrives twice (retries / recovery).
 
 def checkout_2pc(order_id: str):
-    order_entry: OrderValue = get_order_from_db(order_id)
-
-    if order_entry.status == STATUS_PAID:
-        return Response("Checkout successful", status=200)
-    if order_entry.status in (STATUS_FAILED, STATUS_STARTED):
-        abort(400, f"Order {order_id} is in terminal/in-progress state: {order_entry.status}")
-
-    # Mark as in-progress AND register in the coordinator WAL atomically.
-    # Using a pipeline (MULTI/EXEC) so a crash between the two writes cannot
-    # leave the order in STATUS_STARTED without a WAL entry — which would
-    # strand it forever because recovery only looks at the WAL.
-    order_entry.status = STATUS_STARTED
+    # Use WATCH so that only one of multiple concurrent workers (gunicorn) can
+    # claim a STATUS_PENDING order.  Without WATCH, two workers could both read
+    # STATUS_PENDING, both pass the guards, and both act as coordinator for the
+    # same transaction.  With WATCH, the second worker's MULTI/EXEC will get a
+    # WatchError because the first worker already updated the key, and the
+    # second will re-read the now-STATUS_STARTED order and return 400.
     try:
-        with db.pipeline(transaction=True) as pipe:
-            pipe.set(order_id, msgpack.encode(order_entry))
-            pipe.sadd(COORD_PENDING_KEY, order_id)
-            pipe.execute()
+        with db.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(order_id)
+                    raw = pipe.get(order_id)   # immediate execution in WATCH mode
+                    if not raw:
+                        pipe.reset()
+                        abort(400, f"Order: {order_id} not found!")
+                    order_entry: OrderValue = msgpack.decode(raw, type=OrderValue)
+
+                    if order_entry.status == STATUS_PAID:
+                        pipe.reset()
+                        return Response("Checkout successful", status=200)
+                    if order_entry.status in (STATUS_FAILED, STATUS_STARTED):
+                        pipe.reset()
+                        abort(400, f"Order {order_id} is in terminal/in-progress state: {order_entry.status}")
+
+                    # Atomically claim the order and add it to the coordinator WAL.
+                    # If another worker modified the key since WATCH, WatchError is
+                    # raised and we loop back to re-read the updated status.
+                    order_entry.status = STATUS_STARTED
+                    pipe.multi()
+                    pipe.set(order_id, msgpack.encode(order_entry))
+                    pipe.sadd(COORD_PENDING_KEY, order_id)
+                    pipe.execute()
+                    break   # successfully claimed
+                except redis.exceptions.WatchError:
+                    continue  # another worker changed the key; re-read and retry
     except redis.exceptions.RedisError:
         abort(400, DB_ERROR_STR)
 
