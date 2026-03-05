@@ -136,9 +136,8 @@ def send_post_request(url: str, retries: int = 3) -> requests.Response | None:
         try:
             response = requests.post(url, timeout=5)
             return response
-        except requests.exceptions.RequestException:
-            if attempt == retries - 1:
-                abort(400, REQ_ERROR_STR)
+        except requests.exceptions.RequestException as exc:
+            app.logger.warning(f"POST {url} attempt {attempt + 1}/{retries} failed: {exc}")
     return None
 
 def send_get_request(url: str, retries: int = 3) -> requests.Response | None:
@@ -146,25 +145,45 @@ def send_get_request(url: str, retries: int = 3) -> requests.Response | None:
         try:
             response = requests.get(url, timeout=5)
             return response
-        except requests.exceptions.RequestException:
-            if attempt == retries - 1:
-                abort(400, REQ_ERROR_STR)
+        except requests.exceptions.RequestException as exc:
+            app.logger.warning(f"GET {url} attempt {attempt + 1}/{retries} failed: {exc}")
     return None
 
 
 @app.post('/addItem/<order_id>/<item_id>/<quantity>')
 def add_item(order_id: str, item_id: str, quantity: int):
-    order_entry: OrderValue = get_order_from_db(order_id)
+    # Fetch item price first (outside the Redis transaction — read-only, no lock needed).
     item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
-    if item_reply.status_code != 200:
-        # Request failed because item does not exist
+    if item_reply is None or item_reply.status_code != 200:
         abort(400, f"Item: {item_id} does not exist!")
     item_json: dict = item_reply.json()
-    order_entry.items.append((item_id, int(quantity)))
-    order_entry.total_cost += int(quantity) * item_json["price"]
-    save_order(order_id, order_entry)
-    return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
-                    status=200)
+    price_per_unit = int(quantity) * item_json["price"]
+
+    # Use WATCH/MULTI/EXEC so that two concurrent addItem calls on the same
+    # order_id cannot overwrite each other.
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(order_id)
+                raw = pipe.get(order_id)
+                if raw is None:
+                    pipe.unwatch()
+                    abort(400, f"Order: {order_id} not found!")
+                order_entry = msgpack.decode(raw, type=OrderValue)
+                order_entry.items.append((item_id, int(quantity)))
+                order_entry.total_cost += price_per_unit
+                pipe.multi()
+                pipe.set(order_id, msgpack.encode(order_entry))
+                pipe.execute()
+                return Response(
+                    f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
+                    status=200,
+                )
+        except redis.WatchError:
+            continue  # concurrent write detected — retry with fresh state
+        except redis.exceptions.RedisError:
+            abort(400, DB_ERROR_STR)
+    abort(400, "Conflict: could not add item after retries")
 
 
 def rollback_stock(removed_items: list[tuple[str, int]]):
@@ -230,22 +249,22 @@ def checkout_saga(order_id: str):
     removed_items: list[tuple[str, int]] = []
     for item_id, quantity in items_quantities.items():
         stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
+        if stock_reply is None or stock_reply.status_code != 200:
+            # Network failure (None) or out-of-stock (non-200): compensate then abort.
             rollback_stock(removed_items)
             order_entry.status = STATUS_FAILED
             save_order(order_id, order_entry)
-            abort(400, f"Out of stock on item_id: {item_id}")
+            abort(400, f"Out of stock on item_id: {item_id}" if stock_reply else REQ_ERROR_STR)
         removed_items.append((item_id, quantity))
 
     # FORWARD step 2: Deduct Payment
     user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
-        # Backward: Release all reserved stock
+    if user_reply is None or user_reply.status_code != 200:
+        # Network failure (None) or insufficient credit (non-200): compensate then abort.
         rollback_stock(removed_items)
         order_entry.status = STATUS_FAILED
         save_order(order_id, order_entry)
-        abort(400, "User out of credit")
+        abort(400, "User out of credit" if user_reply else REQ_ERROR_STR)
 
     # Finalize: mark paid in DB
     order_entry.paid = True
@@ -343,17 +362,17 @@ def checkout_2pc(order_id: str):
         reply = send_post_request(
             f"{GATEWAY_URL}/stock/prepare_subtract/{order_id}/{item_id}/{quantity}"
         )
-        if reply.status_code != 200:
+        if reply is None or reply.status_code != 200:
             _abort_2pc(order_id, order_entry, prepared_stock, payment_prepared)
-            abort(400, f"2PC prepare failed: out of stock on item {item_id}")
+            abort(400, f"2PC prepare failed: out of stock on item {item_id}" if reply else REQ_ERROR_STR)
         prepared_stock.append((item_id, quantity))
 
     reply = send_post_request(
         f"{GATEWAY_URL}/payment/prepare_pay/{order_id}/{order_entry.user_id}/{order_entry.total_cost}"
     )
-    if reply.status_code != 200:
+    if reply is None or reply.status_code != 200:
         _abort_2pc(order_id, order_entry, prepared_stock, payment_prepared)
-        abort(400, "2PC prepare failed: user out of credit")
+        abort(400, "2PC prepare failed: user out of credit" if reply else REQ_ERROR_STR)
 
     payment_prepared = True
 
