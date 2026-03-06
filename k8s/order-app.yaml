@@ -51,4 +51,17 @@ spec:
             - name: REDIS_PASSWORD
               value: "redis"
             - name: REDIS_DB
-              value: "0"
+              value: "0"            
+            - name: CHECKOUT_MODE
+              value: "saga"
+```
+---
+
+## How `status` flows
+```
+create_order  →  pending
+checkout hit  →  started   (written before any service calls — crash-safe marker)
+stock fails   →  failed    (stock released)
+payment fails →  failed    (stock released)
+db.set fails  →  failed    (payment refunded, stock released)
+all succeeds  →  paid
