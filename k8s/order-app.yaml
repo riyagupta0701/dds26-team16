@@ -3,7 +3,7 @@
 # =============================================================================
 # The order service is the transaction COORDINATOR. It is the entry point for
 # checkouts and will orchestrate either a Saga or 2PC across the stock and
-# payment services (depending on the PROTOCOL env var).
+# payment services (depending on the CHECKOUT_MODE env var).
 # =============================================================================
 
 apiVersion: v1
@@ -26,15 +26,18 @@ kind: Deployment
 metadata:
   name: order-deployment
 spec:
-  replicas: 1
+  replicas: 2
+
   selector:
     matchLabels:
       component: order
+
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxUnavailable: 0
       maxSurge: 1
+
   template:
     metadata:
       labels:
@@ -51,14 +54,14 @@ spec:
               memory: "512Mi"
               cpu: "1"
           command: ["gunicorn"]
-          args: ["-b", "0.0.0.0:5000", "-w", "2", "--timeout", "30",
+          args: ["-b", "0.0.0.0:5000", "-w", "4", "--timeout", "30",
                  "--log-level", "info", "app:app"]
           ports:
             - containerPort: 5000
           readinessProbe:
             tcpSocket:
               port: 5000
-            initialDelaySeconds: 5 
+            initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
@@ -67,10 +70,9 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 30
             failureThreshold: 3
-
           env:
-            - name: PROTOCOL
-              value: "saga"          # Which protocol to use: "saga" or "2pc"
+            - name: CHECKOUT_MODE
+              value: "saga"          # Switch to "2pc" to benchmark the other protocol
             - name: GATEWAY_URL
               value: "http://gateway:80"
             - name: REDIS_HOST
@@ -80,4 +82,4 @@ spec:
             - name: REDIS_PASSWORD
               value: "redis"
             - name: REDIS_DB
-              value: "0"
+              value: "0"            # order=DB0, stock=DB1, payment=DB2 (shared Redis)

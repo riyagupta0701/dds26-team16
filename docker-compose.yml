@@ -1,4 +1,3 @@
-version: "3"
 services:
 
   gateway:
@@ -8,59 +7,183 @@ services:
     ports:
       - "8000:80"
     depends_on:
-      - order-service
-      - stock-service
-      - payment-service
+      - order-service-1
+      - order-service-2
+      - stock-service-1
+      - stock-service-2
+      - payment-service-1
+      - payment-service-2
+    restart: unless-stopped
 
-  order-service:
+  # ORDER SERVICE
+  order-service-1:
     build: ./order
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
-      - PROTOCOL=saga
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
-    env_file:
-      - env/order_redis.env
+      - CHECKOUT_MODE=saga
+      - REDIS_HOST=order-redis-master
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+    command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
-      - order-db
+      order-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
 
-  order-db:
+  order-service-2:
+    build: ./order
+    image: order:latest
+    environment:
+      - GATEWAY_URL=http://gateway:80
+      - CHECKOUT_MODE=saga
+      - REDIS_HOST=order-redis-master
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+    command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
+    depends_on:
+      order-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  order-redis-master:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec
+    # --appendonly yes + --appendfsync everysec: AOF persistence, fsync once/sec.
+    # Guarantees at most 1 second of data loss on a hard crash.
+    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb",
+              "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
-      - order-db-data:/data
+      - order-master-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
 
-  stock-service:
+  order-redis-replica:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--replicaof", "order-redis-master", "6379",
+              "--masterauth", "redis", "--maxmemory", "512mb", "--appendonly", "yes"]
+    volumes:
+      - order-replica-data:/data
+    depends_on:
+      order-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # STOCK SERVICE
+  stock-service-1:
     build: ./stock
     image: stock:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
-    env_file:
-      - env/stock_redis.env
+    environment:
+      - REDIS_HOST=stock-redis-master
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+    command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
-      - stock-db
+      stock-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
 
-  stock-db:
+  stock-service-2:
+    build: ./stock
+    image: stock:latest
+    environment:
+      - REDIS_HOST=stock-redis-master
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+    command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
+    depends_on:
+      stock-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  stock-redis-master:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec
+    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb",
+              "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
-      - stock-db-data:/data
+      - stock-master-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
 
-  payment-service:
+  stock-redis-replica:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--replicaof", "stock-redis-master", "6379",
+              "--masterauth", "redis", "--maxmemory", "512mb", "--appendonly", "yes"]
+    volumes:
+      - stock-replica-data:/data
+    depends_on:
+      stock-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # PAYMENT SERVICE
+  payment-service-1:
     build: ./payment
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
-    env_file:
-      - env/payment_redis.env
+    environment:
+      - REDIS_HOST=payment-redis-master
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+    command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
-      - payment-db
+      payment-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
 
-  payment-db:
+  payment-service-2:
+    build: ./payment
+    image: user:latest
+    environment:
+      - REDIS_HOST=payment-redis-master
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+    command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
+    depends_on:
+      payment-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  payment-redis-master:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --appendfsync everysec
+    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb",
+              "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
-      - payment-db-data:/data
+      - payment-master-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  payment-redis-replica:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--replicaof", "payment-redis-master", "6379",
+              "--masterauth", "redis", "--maxmemory", "512mb", "--appendonly", "yes"]
+    volumes:
+      - payment-replica-data:/data
+    depends_on:
+      payment-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
-  order-db-data:
-  stock-db-data:
-  payment-db-data:
+  order-master-data:
+  order-replica-data:
+  stock-master-data:
+  stock-replica-data:
+  payment-master-data:
+  payment-replica-data:
