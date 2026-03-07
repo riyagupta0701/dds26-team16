@@ -277,7 +277,7 @@ DEPLOY_MODE=kube BASE_URL=http://localhost:8080 bash test-scripts/run_all.sh
 ### Deletion of the stack
 
 ```bash
-helm uninstall redis nginx
+helm uninstall order-redis stock-redis payment-redis nginx
 kubectl delete -f k8s/
 kubectl delete configmap gateway-nginx-conf
 kubectl delete pvc --all
@@ -367,6 +367,7 @@ BASE_URL=http://192.168.1.100:8000 bash test-scripts/run_all.sh
 | `07_mode_flag.sh` | Switches `CHECKOUT_MODE` between `saga` and `2pc` at runtime; both modes produce correct end-to-end results and correct compensation |
 | `08_consistency_check.sh` | Fires 10 concurrent checkouts against the same item; verifies no negative stock/credit and no lost updates |
 | `09_2pc_protocol.sh` | Directly exercises all 2PC participant endpoints: prepare/commit/abort idempotency, double-spend prevention under reservations, reservation conflict detection |
+| `10_redis_aof_persistence.sh` | Crashes all three Redis masters and verifies stock, credit, and order data is fully restored on restart — proving AOF persistence works end-to-end |
 <!-- | `06_fault_redis_master.sh` | Kills each Redis master; Sentinel promotes replica within 8 s; checkout uninterrupted *(disabled in `run_all.sh` by default — run manually)* | #TODO -->
 
 ## Technology stack

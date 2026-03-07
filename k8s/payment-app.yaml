@@ -77,10 +77,10 @@ spec:
 
           env:
             - name: REDIS_HOST
-              value: "redis-master"
+              value: "payment-redis-master"
             - name: REDIS_PORT
               value: "6379"
             - name: REDIS_PASSWORD
               value: "redis"
             - name: REDIS_DB
-              value: "2"
+              value: "0"

@@ -7,10 +7,12 @@ docker build -t order:latest ./order
 docker build -t stock:latest ./stock
 docker build -t payment:latest ./payment
 
-# 2. Install Redis with Helm
+# 2. Install one Redis instance per service (mirrors the docker-compose architecture)
 helm repo add bitnami https://charts.bitnami.com/bitnami
 helm repo update
-helm upgrade --install redis bitnami/redis -f helm-config/redis-helm-values-minikube.yaml
+helm upgrade --install order-redis   bitnami/redis -f helm-config/redis-helm-values-minikube.yaml
+helm upgrade --install stock-redis   bitnami/redis -f helm-config/redis-helm-values-minikube.yaml
+helm upgrade --install payment-redis bitnami/redis -f helm-config/redis-helm-values-minikube.yaml
 
 # 3. Enable the minikube ingress addon
 minikube addons enable ingress

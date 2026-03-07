@@ -77,10 +77,10 @@ spec:
             - name: GATEWAY_URL
               value: "http://gateway:80"
             - name: REDIS_HOST
-              value: "redis-master"
+              value: "order-redis-master"
             - name: REDIS_PORT
               value: "6379"
             - name: REDIS_PASSWORD
               value: "redis"
             - name: REDIS_DB
-              value: "0"            # order=DB0, stock=DB1, payment=DB2 (shared Redis)
+              value: "0"

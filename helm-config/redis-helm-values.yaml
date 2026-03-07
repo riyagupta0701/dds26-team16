@@ -1,9 +1,8 @@
 # =============================================================================
 # Redis Helm Chart Values (bitnami/redis)
 # =============================================================================
-# Shared Redis instance (1 master + 1 replica) with AOF persistence enabled.
-# Each service uses a separate logical database to avoid key collisions:
-#   order=DB0, stock=DB1, payment=DB2
+# Redis instance (1 master + 1 replica) with AOF persistence enabled.
+# Deployed once per service (order-redis, stock-redis, payment-redis).
 # =============================================================================
 
 auth:

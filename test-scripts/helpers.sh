@@ -109,25 +109,34 @@ create_order_with_item() {
 # Runtime helpers — work in both DEPLOY_MODE=docker and DEPLOY_MODE=kube
 # ---------------------------------------------------------------------------
 
-# Maps a docker-compose service name (e.g. "order-service-1") to the
-# Kubernetes component label (e.g. "order").
-_kube_component() {
+# Maps a docker-compose service name to a Kubernetes resource:
+#   app services  → component label (used by Deployments)
+#   redis masters → StatefulSet pod name
+_kube_resource() {
   case "$1" in
-    *order*)   echo "order"   ;;
-    *stock*)   echo "stock"   ;;
-    *payment*) echo "payment" ;;
+    *order-redis*)   echo "pod/redis-master-0"          ;;  # shared Redis in K8s
+    *stock-redis*)   echo "pod/redis-master-0"          ;;
+    *payment-redis*) echo "pod/redis-master-0"          ;;
+    *order*)         echo "label:component=order"       ;;
+    *stock*)         echo "label:component=stock"       ;;
+    *payment*)       echo "label:component=payment"     ;;
   esac
 }
 
 # Kill one replica of a service.
 # docker: docker compose stop <name>
-# kube:   delete one pod selected by component label (K8s recreates it)
+# kube:   delete the pod (K8s / StatefulSet recreates it automatically)
 service_stop() {
   local svc="$1"
   if [ "$DEPLOY_MODE" = "kube" ]; then
-    local component pod
-    component=$(_kube_component "$svc")
-    pod=$(kubectl get pod -l "component=$component" -o name | head -1)
+    local resource pod
+    resource=$(_kube_resource "$svc")
+    if [[ "$resource" == pod/* ]]; then
+      pod="$resource"
+    else
+      local label="${resource#label:}"
+      pod=$(kubectl get pod -l "$label" -o name | head -1)
+    fi
     yellow "Deleting $pod..."
     kubectl delete "$pod" --grace-period=0 --wait=false > /dev/null 2>&1
   else
@@ -137,15 +146,47 @@ service_stop() {
 
 # Restore a service replica.
 # docker: docker compose start <name>
-# kube:   wait for the deployment to reach full readiness (pod is auto-recreated)
+# kube:   wait for the pod/deployment to reach full readiness
 service_start() {
   local svc="$1"
   if [ "$DEPLOY_MODE" = "kube" ]; then
-    local component
-    component=$(_kube_component "$svc")
-    kubectl rollout status "deployment/${component}-deployment" --timeout=60s > /dev/null 2>&1
+    local resource
+    resource=$(_kube_resource "$svc")
+    if [[ "$resource" == pod/* ]]; then
+      kubectl wait "${resource}" --for=condition=Ready --timeout=60s > /dev/null 2>&1
+    else
+      local label="${resource#label:}"
+      local component="${label#component=}"
+      kubectl rollout status "deployment/${component}-deployment" --timeout=60s > /dev/null 2>&1
+    fi
   else
     docker compose start "$svc" > /dev/null 2>&1
+  fi
+}
+
+# Crash ALL Redis masters (simulates a full data-store outage / power loss).
+# docker: stops all three per-service masters
+# kube:   deletes the single shared redis-master-0 pod (StatefulSet recreates it)
+redis_crash() {
+  yellow "Crashing Redis masters..."
+  if [ "$DEPLOY_MODE" = "kube" ]; then
+    kubectl delete pod/order-redis-master-0 pod/stock-redis-master-0 pod/payment-redis-master-0 \
+      --grace-period=0 --wait=false > /dev/null 2>&1
+  else
+    docker compose stop order-redis-master stock-redis-master payment-redis-master > /dev/null 2>&1
+  fi
+}
+
+# Restart ALL Redis masters and wait until they are ready (AOF replay complete).
+# docker: starts all three masters
+# kube:   waits for all three StatefulSet pods to become Ready again
+redis_restore() {
+  yellow "Restarting Redis masters (AOF replay on startup)..."
+  if [ "$DEPLOY_MODE" = "kube" ]; then
+    kubectl wait pod/order-redis-master-0 pod/stock-redis-master-0 pod/payment-redis-master-0 \
+      --for=condition=Ready --timeout=60s > /dev/null 2>&1
+  else
+    docker compose start order-redis-master stock-redis-master payment-redis-master > /dev/null 2>&1
   fi
 }
 
@@ -157,6 +198,7 @@ set_checkout_mode() {
   if [ "$DEPLOY_MODE" = "kube" ]; then
     kubectl set env deployment/order-deployment CHECKOUT_MODE="$mode" > /dev/null 2>&1
     kubectl rollout status deployment/order-deployment --timeout=60s > /dev/null 2>&1
+    sleep 4  # allow gunicorn workers to warm up Redis connections and run 2PC recovery
   else
     local override="/tmp/checkout_mode_override_$$.yml"
     cat > "$override" <<YAML
