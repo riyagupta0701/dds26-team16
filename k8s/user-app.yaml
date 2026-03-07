@@ -24,7 +24,7 @@ kind: Deployment
 metadata:
   name: user-deployment
 spec:
-  replicas: 1
+  replicas: 2
 
   selector:
     matchLabels:
@@ -54,7 +54,7 @@ spec:
               cpu: "1"
 
           command: ["gunicorn"]
-          args: ["-b", "0.0.0.0:5000", "-w", "2", "--timeout", "30",
+          args: ["-b", "0.0.0.0:5000", "-w", "4", "--timeout", "30",
                  "--log-level", "info", "app:app"]
 
           ports:
