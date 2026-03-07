@@ -49,8 +49,10 @@ echo "Target: $BASE_URL"
 echo ""
 echo -e "${YELLOW}→  Waiting for stack to be ready...${RESET}"
 for i in $(seq 1 30); do
+  # Any HTTP response (even 400 "not found") means the full stack is up and
+  # routing correctly. "000" means the gateway is not reachable at all.
   CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/stock/find/0" 2>/dev/null || echo "000")
-  if [ "$CODE" = "200" ]; then
+  if [ "$CODE" != "000" ]; then
     echo -e "${GREEN}✔  Stack is ready${RESET}"
     break
   fi
