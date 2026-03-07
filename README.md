@@ -249,6 +249,45 @@ curl -s http://localhost:8000/stock/find/0
 curl -s http://localhost:8000/payment/find_user/$USER
 ```
 
+### Kubernetes — minikube (local)
+
+**Prerequisites:** minikube, helm, kubectl, docker
+
+```bash
+# 1. Start minikube
+minikube start
+
+# 2. Build images + install Helm charts (Redis + nginx ingress) + apply all manifests
+bash deploy-charts-minikube.sh
+
+# 3. Watch pods come up (all should reach Running 1/1)
+kubectl get pods -w
+```
+
+Once all pods are `Running`, forward the ingress port in a separate terminal, then run the tests:
+
+```bash
+# Terminal 1 — keep running
+kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80
+
+# Terminal 2
+DEPLOY_MODE=kube BASE_URL=http://localhost:8080 bash test-scripts/run_all.sh
+```
+
+### Deletion of the stack
+
+```bash
+helm uninstall redis nginx
+kubectl delete -f k8s/
+kubectl delete configmap gateway-nginx-conf
+kubectl delete pvc --all
+```
+
+Or to destroy the entire minikube cluster:
+```bash
+minikube delete
+```
+
 
 ## Configuration
 

@@ -14,40 +14,8 @@ header "TEST 7 — Mode Flag (SAGA vs 2PC)"
 
 seed_data
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-_set_checkout_mode() {
-  local mode="$1"
-  local override="/tmp/checkout_mode_override_$$.yml"
-
-  # Map-format override so docker compose MERGES rather than replaces the
-  # base service environment (list format would wipe REDIS_HOST etc.).
-  cat > "$override" <<YAML
-services:
-  order-service-1:
-    environment:
-      CHECKOUT_MODE: "${mode}"
-  order-service-2:
-    environment:
-      CHECKOUT_MODE: "${mode}"
-YAML
-
-  docker compose stop order-service-1 order-service-2 > /dev/null 2>&1
-
-  if [ "$mode" = "saga" ]; then
-    # Restore from the canonical compose file (no override needed).
-    docker compose up -d --no-deps order-service-1 order-service-2 > /dev/null 2>&1
-  else
-    docker compose -f docker-compose.yml -f "$override" \
-      up -d --no-deps order-service-1 order-service-2 > /dev/null 2>&1
-  fi
-
-  rm -f "$override"
-  sleep 4  # allow gunicorn workers to start and run 2PC recovery
-}
-
 # Always restore saga mode on script exit so subsequent tests are unaffected.
-_restore_saga() { _set_checkout_mode saga 2>/dev/null; }
+_restore_saga() { set_checkout_mode saga 2>/dev/null; }
 trap _restore_saga EXIT
 
 # ── Section A: SAGA end-to-end ────────────────────────────────────────────────
@@ -76,7 +44,7 @@ assert_lte "SAGA credit decreased" "$CREDIT_BEFORE" "$CREDIT_AFTER"
 # ── Section B: 2PC end-to-end ─────────────────────────────────────────────────
 
 yellow "[ B ] Switching to CHECKOUT_MODE=2pc..."
-_set_checkout_mode 2pc
+set_checkout_mode 2pc
 yellow "    Order services restarted with CHECKOUT_MODE=2pc"
 
 USER_2PC=$(create_funded_user 200)
@@ -125,7 +93,7 @@ assert_eq "2PC failed order.status = failed" "failed" "$STATUS_BROKE"
 # ── Restore saga (trap also fires on exit, this is belt-and-suspenders) ───────
 
 yellow "[ D ] Restoring CHECKOUT_MODE=saga..."
-_set_checkout_mode saga
+set_checkout_mode saga
 yellow "    Order services restored"
 
 USER_SAGA2=$(create_funded_user 200)

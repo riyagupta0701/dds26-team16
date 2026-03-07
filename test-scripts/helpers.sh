@@ -2,6 +2,7 @@
 # Shared helpers for all test scripts
 
 BASE_URL="${BASE_URL:-http://localhost:8000}"
+DEPLOY_MODE="${DEPLOY_MODE:-docker}"   # "docker" or "kube"
 PASS=0
 FAIL=0
 
@@ -102,4 +103,79 @@ create_order_with_item() {
   oid=$(json_field "$body" "order_id")
   curl -s -X POST "$BASE_URL/orders/addItem/$oid/$item_id/$qty" > /dev/null
   echo "$oid"
+}
+
+# ---------------------------------------------------------------------------
+# Runtime helpers — work in both DEPLOY_MODE=docker and DEPLOY_MODE=kube
+# ---------------------------------------------------------------------------
+
+# Maps a docker-compose service name (e.g. "order-service-1") to the
+# Kubernetes component label (e.g. "order").
+_kube_component() {
+  case "$1" in
+    *order*)   echo "order"   ;;
+    *stock*)   echo "stock"   ;;
+    *payment*) echo "payment" ;;
+  esac
+}
+
+# Kill one replica of a service.
+# docker: docker compose stop <name>
+# kube:   delete one pod selected by component label (K8s recreates it)
+service_stop() {
+  local svc="$1"
+  if [ "$DEPLOY_MODE" = "kube" ]; then
+    local component pod
+    component=$(_kube_component "$svc")
+    pod=$(kubectl get pod -l "component=$component" -o name | head -1)
+    yellow "Deleting $pod..."
+    kubectl delete "$pod" --grace-period=0 --wait=false > /dev/null 2>&1
+  else
+    docker compose stop "$svc" > /dev/null 2>&1
+  fi
+}
+
+# Restore a service replica.
+# docker: docker compose start <name>
+# kube:   wait for the deployment to reach full readiness (pod is auto-recreated)
+service_start() {
+  local svc="$1"
+  if [ "$DEPLOY_MODE" = "kube" ]; then
+    local component
+    component=$(_kube_component "$svc")
+    kubectl rollout status "deployment/${component}-deployment" --timeout=60s > /dev/null 2>&1
+  else
+    docker compose start "$svc" > /dev/null 2>&1
+  fi
+}
+
+# Switch CHECKOUT_MODE on the order service.
+# docker: rewrites the service via a compose override file
+# kube:   kubectl set env + waits for rolling update to complete
+set_checkout_mode() {
+  local mode="$1"
+  if [ "$DEPLOY_MODE" = "kube" ]; then
+    kubectl set env deployment/order-deployment CHECKOUT_MODE="$mode" > /dev/null 2>&1
+    kubectl rollout status deployment/order-deployment --timeout=60s > /dev/null 2>&1
+  else
+    local override="/tmp/checkout_mode_override_$$.yml"
+    cat > "$override" <<YAML
+services:
+  order-service-1:
+    environment:
+      CHECKOUT_MODE: "${mode}"
+  order-service-2:
+    environment:
+      CHECKOUT_MODE: "${mode}"
+YAML
+    docker compose stop order-service-1 order-service-2 > /dev/null 2>&1
+    if [ "$mode" = "saga" ]; then
+      docker compose up -d --no-deps order-service-1 order-service-2 > /dev/null 2>&1
+    else
+      docker compose -f docker-compose.yml -f "$override" \
+        up -d --no-deps order-service-1 order-service-2 > /dev/null 2>&1
+    fi
+    rm -f "$override"
+    sleep 4  # let gunicorn workers start and run 2PC recovery
+  fi
 }

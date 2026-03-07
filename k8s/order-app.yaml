@@ -46,6 +46,7 @@ spec:
       containers:
         - name: order
           image: order:latest
+          imagePullPolicy: Never
           resources:
             requests:
               memory: "256Mi"
