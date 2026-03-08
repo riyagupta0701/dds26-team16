@@ -38,10 +38,12 @@ STATUS_PENDING = "pending"   # created, not yet checked out
 STATUS_STARTED = "started"   # checkout in progress (crash-safe marker)
 STATUS_PAID    = "paid"      # completed successfully
 STATUS_FAILED  = "failed"    # rolled back
+STATUS_STOCK_RESERVED = "stock_reserved" # Saga: stock reserved, payment pending
 
 # Redis key for the coordinator WAL: a set of order_ids currently in-flight.
 # On startup, unresolved entries are used to recover hanging transactions.
 COORD_PENDING_KEY = "2pc:pending"
+SAGA_PENDING_KEY = "saga:pending"
 
 
 class OrderValue(Struct, kw_only=True):
@@ -211,7 +213,8 @@ def checkout_saga(order_id: str):
 
     Forward transitions:
         STATUS_PENDING -> STATUS_STARTED
-        STATUS_STARTED -> (Reserve Stock) -> (Deduct Payment) -> STATUS_PAID
+        STATUS_STARTED -> (Reserve Stock) -> STATUS_STOCK_RESERVED
+        STATUS_STOCK_RESERVED -> (Deduct Payment) -> STATUS_PAID
 
     Backward / compensation transitions on failure:
         Deduct Payment failed  -> Refund Payment (no-op here, never charged)
@@ -223,8 +226,8 @@ def checkout_saga(order_id: str):
 
     Idempotency:
         STATUS_PAID    -> return 200 immediately (benchmark retry-safe)
-        STATUS_FAILED  -> return 400 immediately (do not re-execute)
-        STATUS_STARTED -> crash recovery: treat as failed, return 400
+        STATUS_FAILED  -> executed as STATUS_PENDING (clean slate)
+        STATUS_STARTED/STATUS_STOCK_RESERVED -> crash recovery: treat as failed, return 400
                           (order was in-flight when a container died)
     """
     order_entry: OrderValue = get_order_from_db(order_id)
@@ -233,12 +236,21 @@ def checkout_saga(order_id: str):
     # --- Idempotency guards ---
     if order_entry.status == STATUS_PAID:
         return Response("Checkout successful", status=200)
-    if order_entry.status in (STATUS_FAILED, STATUS_STARTED):
+    # Allow retrying if FAILED (e.g. user added funds)
+    if order_entry.status in (STATUS_STARTED, STATUS_STOCK_RESERVED):
         abort(400, f"Order {order_id} is in terminal/in-progress state: {order_entry.status}")
 
     # --- Mark in-flight before any side effects (crash-safe marker) ---
+    # We use a transaction here instead of save_order to ensure the status change
+    # and the WAL entry (SAGA_PENDING_KEY) are persisted atomically.
     order_entry.status = STATUS_STARTED
-    save_order(order_id, order_entry)
+    try:
+        with db.pipeline(transaction=True) as pipe:
+            pipe.set(order_id, msgpack.encode(order_entry))
+            pipe.sadd(SAGA_PENDING_KEY, order_id)
+            pipe.execute()
+    except redis.exceptions.RedisError:
+        abort(400, DB_ERROR_STR)
 
     # Aggregate quantities across duplicate item entries
     items_quantities: dict[str, int] = defaultdict(int)
@@ -253,24 +265,56 @@ def checkout_saga(order_id: str):
             # Network failure (None) or out-of-stock (non-200): compensate then abort.
             rollback_stock(removed_items)
             order_entry.status = STATUS_FAILED
-            save_order(order_id, order_entry)
+            try:
+                with db.pipeline(transaction=True) as pipe:
+                    pipe.set(order_id, msgpack.encode(order_entry))
+                    pipe.srem(SAGA_PENDING_KEY, order_id)
+                    pipe.execute()
+            except redis.exceptions.RedisError:
+                pass
             abort(400, f"Out of stock on item_id: {item_id}" if stock_reply else REQ_ERROR_STR)
         removed_items.append((item_id, quantity))
+
+    # Checkpoint: Stock Reserved
+    order_entry.status = STATUS_STOCK_RESERVED
+    try:
+        db.set(order_id, msgpack.encode(order_entry))
+    except redis.exceptions.RedisError:
+        # If we can't save the checkpoint, we should probably abort to be safe
+        rollback_stock(removed_items)
+        order_entry.status = STATUS_FAILED
+        try:
+            with db.pipeline(transaction=True) as pipe:
+                pipe.set(order_id, msgpack.encode(order_entry))
+                pipe.srem(SAGA_PENDING_KEY, order_id)
+                pipe.execute()
+        except redis.exceptions.RedisError:
+            pass
+        abort(400, DB_ERROR_STR)
 
     # FORWARD step 2: Deduct Payment
     user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
     if user_reply is None or user_reply.status_code != 200:
-        # Network failure (None) or insufficient credit (non-200): compensate then abort.
+        # Backward: Release all reserved stock
         rollback_stock(removed_items)
         order_entry.status = STATUS_FAILED
-        save_order(order_id, order_entry)
+        try:
+            with db.pipeline(transaction=True) as pipe:
+                pipe.set(order_id, msgpack.encode(order_entry))
+                pipe.srem(SAGA_PENDING_KEY, order_id)
+                pipe.execute()
+        except redis.exceptions.RedisError:
+            pass
         abort(400, "User out of credit" if user_reply else REQ_ERROR_STR)
 
     # Finalize: mark paid in DB
     order_entry.paid = True
     order_entry.status = STATUS_PAID
     try:
-        db.set(order_id, msgpack.encode(order_entry))
+        with db.pipeline(transaction=True) as pipe:
+            pipe.set(order_id, msgpack.encode(order_entry))
+            pipe.srem(SAGA_PENDING_KEY, order_id)
+            pipe.execute()
     except redis.exceptions.RedisError:
         # Backward: Refund Payment then Release Stock.
         # Use _recovery_post so a network error here doesn't abort() and skip
@@ -280,7 +324,10 @@ def checkout_saga(order_id: str):
         order_entry.paid = False
         order_entry.status = STATUS_FAILED
         try:
-            db.set(order_id, msgpack.encode(order_entry))
+            with db.pipeline(transaction=True) as pipe:
+                pipe.set(order_id, msgpack.encode(order_entry))
+                pipe.srem(SAGA_PENDING_KEY, order_id)
+                pipe.execute()
         except redis.exceptions.RedisError:
             pass  # best-effort; status was set in memory
         abort(400, DB_ERROR_STR)
@@ -329,7 +376,7 @@ def checkout_2pc(order_id: str):
                     if order_entry.status == STATUS_PAID:
                         pipe.reset()
                         return Response("Checkout successful", status=200)
-                    if order_entry.status in (STATUS_FAILED, STATUS_STARTED):
+                    if order_entry.status in (STATUS_STARTED,):
                         pipe.reset()
                         abort(400, f"Order {order_id} is in terminal/in-progress state: {order_entry.status}")
 
@@ -572,10 +619,89 @@ def recover_2pc():
     app.logger.info("Recovery: complete")
 
 
-def _run_recovery():
-    """Run 2PC recovery; never raises so a startup failure cannot kill the worker."""
+def recover_saga():
     try:
-        recover_2pc()
+        pending = db.smembers(SAGA_PENDING_KEY)
+    except redis.exceptions.RedisError as exc:
+        app.logger.error(f"Saga Recovery: cannot read WAL: {exc}")
+        return
+
+    if not pending:
+        return
+
+    app.logger.info(f"Saga Recovery: found {len(pending)} in-flight Saga(s)")
+
+    for order_id_bytes in pending:
+        order_id = order_id_bytes.decode()
+        try:
+            raw = db.get(order_id)
+            if not raw:
+                db.srem(SAGA_PENDING_KEY, order_id)
+                continue
+            order = msgpack.decode(raw, type=OrderValue)
+        except Exception:
+            continue
+
+        # If finished, just clean up WAL
+        if order.status in (STATUS_PAID, STATUS_FAILED):
+            db.srem(SAGA_PENDING_KEY, order_id)
+            continue
+
+        # If we are here, the Saga crashed mid-flight.
+        # We need to compensate based on the last known state.
+        
+        items_quantities: dict[str, int] = defaultdict(int)
+        for item_id, quantity in order.items:
+            items_quantities[item_id] += quantity
+
+        if order.status == STATUS_STOCK_RESERVED:
+            # We know Stock was reserved. Payment might have failed or crashed.
+            # Compensation: Release Stock.
+            # (We assume Payment did not happen or will be handled by its own timeout/rollback if it was 2PC, but this is Saga)
+            # Since we didn't write STATUS_PAID, we assume we should fail.
+            app.logger.info(f"Saga Recovery: Compensating STOCK_RESERVED for {order_id}")
+            
+            all_compensated = True
+            for item_id, quantity in items_quantities.items():
+                if not _recovery_post(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}"):
+                    all_compensated = False
+            
+            if all_compensated:
+                order.status = STATUS_FAILED
+                try:
+                    db.set(order_id, msgpack.encode(order))
+                    db.srem(SAGA_PENDING_KEY, order_id)
+                except redis.exceptions.RedisError:
+                    pass
+        
+        elif order.status == STATUS_STARTED:
+            # Crashed during stock reservation.
+            # We don't know which items were reserved.
+            # We can't safely release stock without risking inflation.
+            # We just mark as FAILED and remove from WAL so user can retry.
+            # Stock leak is the trade-off here for simple Sagas.
+            app.logger.warning(f"Saga Recovery: Found STARTED order {order_id}. Marking FAILED (potential stock leak).")
+            order.status = STATUS_FAILED
+            try:
+                db.set(order_id, msgpack.encode(order))
+                db.srem(SAGA_PENDING_KEY, order_id)
+            except redis.exceptions.RedisError:
+                pass
+
+
+def _run_recovery():
+    """Run recovery; never raises so a startup failure cannot kill the worker."""
+    try:
+        # Use a lock to ensure only one worker runs recovery
+        # Lock expires in 10 seconds (enough for a quick recovery check, or at least to prevent thundering herd)
+        if db.set("recovery:lock", "locked", ex=10, nx=True):
+            app.logger.info("Acquired recovery lock. Starting recovery...")
+            recover_2pc()
+            recover_saga()
+            # Release lock? No, let it expire. If we crash during recovery, we want it to expire so another worker can pick it up later (on restart).
+            # Also, we only run this ONCE at startup.
+        else:
+            app.logger.info("Recovery lock exists. Skipping recovery.")
     except Exception as exc:
         app.logger.error(f"Recovery failed at startup: {exc}")
 
