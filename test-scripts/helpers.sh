@@ -68,8 +68,8 @@ get_code() { curl -s -o /dev/null -w "%{http_code}" "$BASE_URL$1"; }
 wait_for_stack() {
   yellow "Waiting for stack to be ready..."
   for i in $(seq 1 30); do
-    code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/stock/find/0" 2>/dev/null)
-    [ "$code" = "200" ] && green "Stack is ready" && return 0
+    code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/stock/find/0" 2>/dev/null || echo "000")
+    [ "$code" != "000" ] && green "Stack is ready" && return 0
     sleep 2
   done
   red "Stack did not become ready in time"
