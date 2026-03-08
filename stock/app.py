@@ -18,10 +18,26 @@ WAL_ABORTED   = b"aborted"
 
 app = Flask("stock-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+_REDIS_PASSWORD    = os.environ.get('REDIS_PASSWORD', '')
+_REDIS_DB          = int(os.environ.get('REDIS_DB', '0'))
+_SENTINEL_HOSTS    = os.environ.get('REDIS_SENTINEL_HOSTS', '')
+_REDIS_MASTER_NAME = os.environ.get('REDIS_MASTER_NAME', 'mymaster')
+
+if _SENTINEL_HOSTS:
+    from redis.sentinel import Sentinel as _Sentinel
+    _peers = [(h.split(':')[0], int(h.split(':')[1])) for h in _SENTINEL_HOSTS.split(',')]
+    db: redis.Redis = _Sentinel(
+        _peers,
+        password=_REDIS_PASSWORD,
+        db=_REDIS_DB,
+    ).master_for(_REDIS_MASTER_NAME, socket_timeout=0.5)
+else:
+    db: redis.Redis = redis.Redis(
+        host=os.environ['REDIS_HOST'],
+        port=int(os.environ['REDIS_PORT']),
+        password=_REDIS_PASSWORD,
+        db=_REDIS_DB,
+    )
 
 
 def close_db_connection():

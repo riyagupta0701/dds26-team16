@@ -1,12 +1,17 @@
 # =============================================================================
 # Redis Helm Chart Values (bitnami/redis)
 # =============================================================================
-# Redis instance (1 master + 1 replica) with AOF persistence enabled.
+# Redis instance (1 master + 1 replica) with AOF persistence and Sentinel HA.
 # Deployed once per service (order-redis, stock-redis, payment-redis).
+# When sentinel.enabled=true the bitnami chart runs a combined StatefulSet:
+#   pods are named {release}-node-0, {release}-node-1, ...
+#   Sentinel listens on port 26379 inside each pod.
+#   The Redis service exposes port 26379 for Sentinel and 6379 for Redis.
 # =============================================================================
 
 auth:
   password: redis
+  sentinel: false   # Sentinel itself does not require a password
 
 # appendonly enable: AOF persistence (survives container restart)
 # appendfsync everysec: flush to disk once per second (max 1s data loss)
@@ -14,13 +19,12 @@ commonConfiguration: |-
   appendonly yes
   appendfsync everysec
 
-master:
-  persistence:
-    size: 4Gi
-  resources:
-    requests:
-      memory: 4Gi
-      cpu: 2
+sentinel:
+  enabled: true
+  masterSet: mymaster
+  quorum: 1
+  downAfterMilliseconds: 5000
+  failoverTimeout: 10000
 
 replica:
   replicaCount: 1

@@ -97,7 +97,7 @@ A fault-tolerant, distributed e-commerce backend built with Flask microservices,
               └─────────────────────────┘
 ```
 
-Each of the three logical services (order, stock, payment) runs as **2 application replicas** behind a shared Nginx upstream pool. Each service has its own isolated **Redis master + replica** pair for data persistence and replication. The stack totals 16 containers.
+Each of the three logical services (order, stock, payment) runs as **2 application replicas** behind a shared Nginx upstream pool. Each service has its own isolated **Redis master + replica + Sentinel** cluster for data persistence, replication, and automatic failover. The stack totals 19 containers (16 original + 3 Sentinels).
 
 
 ## Services
@@ -158,9 +158,9 @@ reserved:payment:{user_id}           → int  (soft-reserved credit)
 
 Nginx upstream pools are configured with `max_fails=1 fail_timeout=5s` and `proxy_next_upstream error timeout http_500 http_502 http_503`. When one replica is killed or crashes, Nginx automatically retries the request on the other within the same client connection. All services have `restart: unless-stopped` so Docker re-creates crashed containers.
 
-### Redis Replica
+### Redis Master Failure (Sentinel Automatic Failover)
 
-Each service has a Redis master and a replica with asynchronous replication and AOF persistence. The replica keeps a copy of all data. If the master is killed and restarted, it re-joins and resyncs from the replica automatically.
+Each service has a **Redis master + replica + Sentinel** cluster. Redis Sentinel continuously monitors the master; if it fails to respond for 5 seconds it triggers an automatic failover — the replica is promoted to master in ~5–8 seconds. All application services use a Sentinel-aware Redis client (`REDIS_SENTINEL_HOSTS` env var) so they discover the new master transparently after failover. The old master, when it restarts, rejoins as a replica. In Kubernetes this is handled by the bitnami/redis Helm chart with `sentinel.enabled=true`.
 
 ### Concurrent Correctness
 
@@ -281,6 +281,8 @@ helm uninstall order-redis stock-redis payment-redis nginx
 kubectl delete -f k8s/
 kubectl delete configmap gateway-nginx-conf
 kubectl delete pvc --all
+kubectl delete pv --all
+
 ```
 
 Or to destroy the entire minikube cluster:
@@ -297,10 +299,12 @@ All configuration is via environment variables defined in `docker-compose.yml`.
 |----------|---------|-------------|---------|
 | `CHECKOUT_MODE` | order | `saga` or `2pc` | `saga` |
 | `GATEWAY_URL` | order | Internal URL for inter-service calls | `http://gateway:80` |
-| `REDIS_HOST` | all | Redis master hostname | per-service name |
+| `REDIS_HOST` | all | Redis master hostname (direct connection fallback) | per-service name |
 | `REDIS_PORT` | all | Redis port | `6379` |
 | `REDIS_PASSWORD` | all | Redis auth password | `redis` |
 | `REDIS_DB` | all | Redis database index | `0` |
+| `REDIS_SENTINEL_HOSTS` | all | Comma-separated `host:port` list of Sentinel nodes | *(not set → direct)* |
+| `REDIS_MASTER_NAME` | all | Sentinel master set name | `mymaster` |
 
 ### Switching checkout mode at runtime
 
@@ -364,11 +368,11 @@ BASE_URL=http://192.168.1.100:8000 bash test-scripts/run_all.sh
 | `03_compensation_payment_fails.sh` | Payment step fails → all reserved stock is released by Saga compensation; credit untouched |
 | `04_compensation_stock_fails.sh` | Stock step fails → order fails immediately; payment step never reached; no stock leaked |
 | `05_fault_app_replica.sh` | Kills each app replica in turn (6 total); Nginx routes to surviving replica; checkout always succeeds |
+| `06_fault_redis_master.sh` | Kills each Redis master in turn; Sentinel promotes the replica within ~5 s; checkout uninterrupted; old master rejoins as replica |
 | `07_mode_flag.sh` | Switches `CHECKOUT_MODE` between `saga` and `2pc` at runtime; both modes produce correct end-to-end results and correct compensation |
 | `08_consistency_check.sh` | Fires 10 concurrent checkouts against the same item; verifies no negative stock/credit and no lost updates |
 | `09_2pc_protocol.sh` | Directly exercises all 2PC participant endpoints: prepare/commit/abort idempotency, double-spend prevention under reservations, reservation conflict detection |
 | `10_redis_aof_persistence.sh` | Crashes all three Redis masters and verifies stock, credit, and order data is fully restored on restart — proving AOF persistence works end-to-end |
-<!-- | `06_fault_redis_master.sh` | Kills each Redis master; Sentinel promotes replica within 8 s; checkout uninterrupted *(disabled in `run_all.sh` by default — run manually)* | #TODO -->
 
 ## Technology stack
 
@@ -377,9 +381,9 @@ BASE_URL=http://192.168.1.100:8000 bash test-scripts/run_all.sh
 | Application services | Python 3.12, Flask, Gunicorn (4 workers per replica) |
 | Serialisation | msgspec (msgpack binary format) |
 | Data store | Redis 7.2 with AOF persistence enabled |
-| Data replication | Redis master + replica per service |
+| Data replication | Redis master + replica + Sentinel per service |
 | Load balancer | Nginx 1.25 with upstream health tracking |
 | Container runtime | Docker Compose v2 |
 | HTTP client | Python requests with 3-attempt retry |
 | Concurrency control | Redis WATCH/MULTI/EXEC optimistic locking |
-<!-- | Automatic failover | Redis Sentinel (optional, exercised by test 06) |    #TODO -->
+| Automatic failover | Redis Sentinel (one per service in docker, bitnami chart in K8s) |

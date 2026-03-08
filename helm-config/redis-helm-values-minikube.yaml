@@ -4,21 +4,18 @@
 
 auth:
   password: redis
+  sentinel: false   # Sentinel itself does not require a password
 
 commonConfiguration: |-
   appendonly yes
   appendfsync everysec
 
-master:
-  persistence:
-    size: 1Gi
-  resources:
-    requests:
-      memory: 256Mi
-      cpu: 100m
-    limits:
-      memory: 512Mi
-      cpu: 500m
+sentinel:
+  enabled: true
+  masterSet: mymaster
+  quorum: 1
+  downAfterMilliseconds: 5000
+  failoverTimeout: 10000
 
 replica:
   replicaCount: 1

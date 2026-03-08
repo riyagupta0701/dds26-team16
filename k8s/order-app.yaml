@@ -77,10 +77,14 @@ spec:
             - name: GATEWAY_URL
               value: "http://gateway:80"
             - name: REDIS_HOST
-              value: "order-redis-master"
+              value: "order-redis"
             - name: REDIS_PORT
               value: "6379"
             - name: REDIS_PASSWORD
               value: "redis"
             - name: REDIS_DB
               value: "0"
+            - name: REDIS_SENTINEL_HOSTS
+              value: "order-redis:26379"
+            - name: REDIS_MASTER_NAME
+              value: "mymaster"
