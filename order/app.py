@@ -376,7 +376,7 @@ def checkout_2pc(order_id: str):
                     if order_entry.status == STATUS_PAID:
                         pipe.reset()
                         return Response("Checkout successful", status=200)
-                    if order_entry.status in (STATUS_STARTED,):
+                    if order_entry.status in (STATUS_STARTED, STATUS_FAILED):
                         pipe.reset()
                         abort(400, f"Order {order_id} is in terminal/in-progress state: {order_entry.status}")
 
