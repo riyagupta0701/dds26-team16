@@ -50,7 +50,10 @@ services:
 
   order-redis-master:
     image: redis:7.2-bookworm
-    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb", "--appendonly", "yes"]
+    # --appendonly yes + --appendfsync everysec: AOF persistence, fsync once/sec.
+    # Guarantees at most 1 second of data loss on a hard crash.
+    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb",
+              "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - order-master-data:/data
     healthcheck:
@@ -102,7 +105,8 @@ services:
 
   stock-redis-master:
     image: redis:7.2-bookworm
-    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb", "--appendonly", "yes"]
+    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb",
+              "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - stock-master-data:/data
     healthcheck:
@@ -154,7 +158,8 @@ services:
 
   payment-redis-master:
     image: redis:7.2-bookworm
-    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb", "--appendonly", "yes"]
+    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb",
+              "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - payment-master-data:/data
     healthcheck:

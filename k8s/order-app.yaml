@@ -1,3 +1,11 @@
+# =============================================================================
+# ORDER SERVICE — Kubernetes Manifests
+# =============================================================================
+# The order service is the transaction COORDINATOR. It is the entry point for
+# checkouts and will orchestrate either a Saga or 2PC across the stock and
+# payment services (depending on the CHECKOUT_MODE env var).
+# =============================================================================
+
 apiVersion: v1
 kind: Service
 metadata:
@@ -10,16 +18,26 @@ spec:
     - port: 5000
       name: http
       targetPort: 5000
+
 ---
+
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: order-deployment
 spec:
-  replicas: 1
+  replicas: 2
+
   selector:
     matchLabels:
       component: order
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
   template:
     metadata:
       labels:
@@ -28,40 +46,41 @@ spec:
       containers:
         - name: order
           image: order:latest
+          imagePullPolicy: Never
           resources:
-            limits:
-              memory: "1Gi"
-              cpu: "1"
             requests:
-              memory: "1Gi"
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
               cpu: "1"
           command: ["gunicorn"]
-          args: ["-b", "0.0.0.0:5000", "app:app"]
+          args: ["-b", "0.0.0.0:5000", "-w", "4", "--timeout", "30",
+                 "--log-level", "info", "app:app"]
           ports:
             - containerPort: 5000
+          readinessProbe:
+            tcpSocket:
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
           env:
-            - name: USER_SERVICE_URL
-              value: "user-service"
-            - name: STOCK_SERVICE_URL
-              value: "stock-service"
+            - name: CHECKOUT_MODE
+              value: "saga"          # Switch to "2pc" to benchmark the other protocol
+            - name: GATEWAY_URL
+              value: "http://gateway:80"
             - name: REDIS_HOST
-              value: redis-master
+              value: "order-redis-master"
             - name: REDIS_PORT
-              value: '6379'
+              value: "6379"
             - name: REDIS_PASSWORD
               value: "redis"
             - name: REDIS_DB
-              value: "0"            
-            - name: CHECKOUT_MODE
-              value: "saga"
-```
----
-
-## How `status` flows
-```
-create_order  →  pending
-checkout hit  →  started   (written before any service calls — crash-safe marker)
-stock fails   →  failed    (stock released)
-payment fails →  failed    (stock released)
-db.set fails  →  failed    (payment refunded, stock released)
-all succeeds  →  paid
+              value: "0"

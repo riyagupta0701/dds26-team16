@@ -1,0 +1,33 @@
+# Redis Helm overrides for local minikube testing.
+# Replaces the resource requests in redis-helm-values.yaml with smaller values
+# so Redis fits on a single-node minikube cluster.
+
+auth:
+  password: redis
+
+commonConfiguration: |-
+  appendonly yes
+  appendfsync everysec
+
+master:
+  persistence:
+    size: 1Gi
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: 500m
+
+replica:
+  replicaCount: 1
+  persistence:
+    size: 1Gi
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: 500m

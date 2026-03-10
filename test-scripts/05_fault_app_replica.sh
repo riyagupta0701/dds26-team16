@@ -10,7 +10,7 @@ SERVICES=("order-service-1" "order-service-2" "stock-service-1" "stock-service-2
 
 for SERVICE in "${SERVICES[@]}"; do
   yellow "Stopping $SERVICE..."
-  docker compose stop "$SERVICE" > /dev/null 2>&1
+  service_stop "$SERVICE"
   sleep 2  # let nginx detect the failure
 
   USER_ID=$(create_funded_user 200)
@@ -19,7 +19,7 @@ for SERVICE in "${SERVICES[@]}"; do
   assert_http "Checkout works with $SERVICE down" "200" "$CODE"
 
   yellow "Restarting $SERVICE..."
-  docker compose start "$SERVICE" > /dev/null 2>&1
+  service_start "$SERVICE"
   sleep 3
 done
 

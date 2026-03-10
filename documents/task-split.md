@@ -59,6 +59,7 @@
 * **K8s & Persistence:** Setup manifests with resource limits and configure Redis AOF (Append Only File) to prevent data loss on DB restart.
 * **Chaos Testing:** Create scripts to kill containers at specific moments (e.g., after a 2PC Prepare but before Commit) to verify Member C's logic.
 * **Performance:** Run Locust and the wdm-benchmark to compare 2PC latency versus Saga latency under load.
+* TODO: Redis sentinal look into it
 
 ### Phase 2
 * **Artifact Packaging:** Lead the creation of the standalone Python package for the Orchestrator.
