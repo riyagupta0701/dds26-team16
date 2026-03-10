@@ -111,15 +111,15 @@ create_order_with_item() {
 
 # Maps a docker-compose service name to a Kubernetes resource:
 #   app services  → component label (used by Deployments)
-#   redis masters → StatefulSet pod name
+#   redis masters → StatefulSet pod name (one StatefulSet per Helm release)
 _kube_resource() {
   case "$1" in
-    *order-redis*)   echo "pod/redis-master-0"          ;;  # shared Redis in K8s
-    *stock-redis*)   echo "pod/redis-master-0"          ;;
-    *payment-redis*) echo "pod/redis-master-0"          ;;
-    *order*)         echo "label:component=order"       ;;
-    *stock*)         echo "label:component=stock"       ;;
-    *payment*)       echo "label:component=payment"     ;;
+    *order-redis*)   echo "pod/order-redis-master-0"   ;;
+    *stock-redis*)   echo "pod/stock-redis-master-0"   ;;
+    *payment-redis*) echo "pod/payment-redis-master-0" ;;
+    *order*)         echo "label:component=order"      ;;
+    *stock*)         echo "label:component=stock"      ;;
+    *payment*)       echo "label:component=payment"    ;;
   esac
 }
 
@@ -166,7 +166,7 @@ service_start() {
 
 # Crash ALL Redis masters (simulates a full data-store outage / power loss).
 # docker: stops all three per-service masters
-# kube:   deletes the single shared redis-master-0 pod (StatefulSet recreates it)
+# kube:   deletes the master-0 pod of each bitnami StatefulSet (each is recreated automatically)
 redis_crash() {
   yellow "Crashing Redis masters..."
   if [ "$DEPLOY_MODE" = "kube" ]; then
@@ -211,12 +211,8 @@ services:
       CHECKOUT_MODE: "${mode}"
 YAML
     docker compose stop order-service-1 order-service-2 > /dev/null 2>&1
-    if [ "$mode" = "saga" ]; then
-      docker compose up -d --no-deps order-service-1 order-service-2 > /dev/null 2>&1
-    else
-      docker compose -f docker-compose.yml -f "$override" \
-        up -d --no-deps order-service-1 order-service-2 > /dev/null 2>&1
-    fi
+    docker compose -f docker-compose.yml -f "$override" \
+      up -d --no-deps order-service-1 order-service-2 > /dev/null 2>&1
     rm -f "$override"
     sleep 4  # let gunicorn workers start and run 2PC recovery
   fi
