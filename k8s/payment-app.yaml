@@ -77,7 +77,7 @@ spec:
 
           env:
             - name: REDIS_HOST
-              value: "payment-redis"
+              value: "payment-redis-master"
             - name: REDIS_PORT
               value: "6379"
             - name: REDIS_PASSWORD
@@ -85,6 +85,6 @@ spec:
             - name: REDIS_DB
               value: "0"
             - name: REDIS_SENTINEL_HOSTS
-              value: "payment-redis:26379"
+              value: "payment-redis-sentinel:26379"
             - name: REDIS_MASTER_NAME
-              value: "mymaster"
+              value: "payment-master"

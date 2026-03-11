@@ -8,8 +8,8 @@ Basic project structure with Python's Flask and Redis.
 * `env`
     Folder containing the Redis env variables for the docker-compose deployment
     
-* `helm-config` 
-   Helm chart values for Redis and ingress-nginx
+* `helm-config`
+   Helm chart values for ingress-nginx (cluster deploy only; Redis runs as plain k8s YAML)
         
 * `k8s`
     Folder containing the kubernetes deployments, apps and services for the ingress, order, payment and stock services.
@@ -39,18 +39,16 @@ K8s is also possible, but we do not require it as part of your submission.
 
 #### minikube (local k8s cluster)
 
-This setup is for local k8s testing to see if your k8s config works before deploying to the cloud. 
-First deploy your database using helm by running the `deploy-charts-minicube.sh` file (in this example the DB is Redis 
-but you can find any database you want in https://artifacthub.io/ and adapt the script). Then adapt the k8s configuration files in the
-`\k8s` folder to mach your system and then run `kubectl apply -f .` in the k8s folder. 
+This setup is for local k8s testing to see if your k8s config works before deploying to the cloud.
+Run `bash deploy-charts-minikube.sh` — this builds the service images into minikube's Docker daemon and applies all manifests in `k8s/` (Redis master+replica+sentinel, gateway, and app services) in one step.
 
-***Requirements:*** You need to have minikube (with ingress enabled) and helm installed on your machine.
+***Requirements:*** You need to have minikube, kubectl, and docker installed on your machine.
 
 #### kubernetes cluster (managed k8s cluster in the cloud)
 
-Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in the helm step to also install an ingress to the cluster. 
+Similarly to the `minikube` deployment but run `bash deploy-charts-cluster.sh`, which also installs the nginx ingress controller via Helm before applying the k8s manifests.
 
-***Requirements:*** You need to have access to kubectl of a k8s cluster.
+***Requirements:*** You need to have access to kubectl of a k8s cluster, and helm installed.
 
 -------------------------------------------------------------------------------------------
 
@@ -160,7 +158,7 @@ Nginx upstream pools are configured with `max_fails=1 fail_timeout=5s` and `prox
 
 ### Redis Master Failure (Sentinel Automatic Failover)
 
-Each service has a **Redis master + replica + Sentinel** cluster. Redis Sentinel continuously monitors the master; if it fails to respond for 5 seconds it triggers an automatic failover — the replica is promoted to master in ~5–8 seconds. All application services use a Sentinel-aware Redis client (`REDIS_SENTINEL_HOSTS` env var) so they discover the new master transparently after failover. The old master, when it restarts, rejoins as a replica. In Kubernetes this is handled by the bitnami/redis Helm chart with `sentinel.enabled=true`.
+Each service has a **Redis master + replica + Sentinel** cluster. Redis Sentinel continuously monitors the master; if it fails to respond for 5 seconds it triggers an automatic failover — the replica is promoted to master in ~5–8 seconds. All application services use a Sentinel-aware Redis client (`REDIS_SENTINEL_HOSTS` env var) so they discover the new master transparently after failover. The old master, when it restarts, rejoins as a replica. The Kubernetes setup mirrors Docker Compose exactly: separate `{svc}-redis-master`, `{svc}-redis-replica`, and `{svc}-redis-sentinel` Deployments using the same `redis:7.2-bookworm` image and commands.
 
 ### Concurrent Correctness
 
@@ -251,16 +249,17 @@ curl -s http://localhost:8000/payment/find_user/$USER
 
 ### Kubernetes — minikube (local)
 
-**Prerequisites:** minikube, helm, kubectl, docker
+**Prerequisites:** minikube, kubectl, docker (no helm required)
 
 ```bash
 # 1. Start minikube
 minikube start
 
-# 2. Build images + install Helm charts (Redis + nginx ingress) + apply all manifests
+# 2. Build images + deploy everything (Redis + gateway + app services)
+#    (also enables the ingress addon automatically)
 bash deploy-charts-minikube.sh
 
-# 3. Watch pods come up (all should reach Running 1/1)
+# 3. Watch pods come up (all should reach Running 1/1 or 2/2)
 kubectl get pods -w
 ```
 
@@ -277,12 +276,8 @@ DEPLOY_MODE=kube BASE_URL=http://localhost:8080 bash test-scripts/run_all.sh
 ### Deletion of the stack
 
 ```bash
-helm uninstall order-redis stock-redis payment-redis nginx
 kubectl delete -f k8s/
 kubectl delete configmap gateway-nginx-conf
-kubectl delete pvc --all
-kubectl delete pv --all
-
 ```
 
 Or to destroy the entire minikube cluster:
@@ -386,4 +381,4 @@ BASE_URL=http://192.168.1.100:8000 bash test-scripts/run_all.sh
 | Container runtime | Docker Compose v2 |
 | HTTP client | Python requests with 3-attempt retry |
 | Concurrency control | Redis WATCH/MULTI/EXEC optimistic locking |
-| Automatic failover | Redis Sentinel (one per service in docker, bitnami chart in K8s) |
+| Automatic failover | Redis Sentinel (one per service; identical setup in Docker and Kubernetes) |

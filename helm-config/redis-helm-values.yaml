@@ -27,7 +27,7 @@ sentinel:
   failoverTimeout: 10000
 
 replica:
-  replicaCount: 1
+  replicaCount: 2
   persistence:
     size: 4Gi
   resources:

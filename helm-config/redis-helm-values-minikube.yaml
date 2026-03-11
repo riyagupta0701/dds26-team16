@@ -16,9 +16,19 @@ sentinel:
   quorum: 1
   downAfterMilliseconds: 5000
   failoverTimeout: 10000
+  # Minikube is slower: give the sentinel container more time to start
+  startupProbe:
+    failureThreshold: 40
+    periodSeconds: 10
+    timeoutSeconds: 10
+  livenessProbe:
+    timeoutSeconds: 10
+    failureThreshold: 10
+  readinessProbe:
+    timeoutSeconds: 5
 
 replica:
-  replicaCount: 1
+  replicaCount: 2
   persistence:
     size: 1Gi
   resources:
@@ -28,3 +38,13 @@ replica:
     limits:
       memory: 512Mi
       cpu: 500m
+  # Minikube is slower: give the redis container more time to start
+  startupProbe:
+    failureThreshold: 40
+    periodSeconds: 10
+    timeoutSeconds: 10
+  livenessProbe:
+    timeoutSeconds: 10
+    failureThreshold: 10
+  readinessProbe:
+    timeoutSeconds: 5

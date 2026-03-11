@@ -69,7 +69,7 @@ spec:
             failureThreshold: 3
           env:
             - name: REDIS_HOST
-              value: "stock-redis"
+              value: "stock-redis-master"
             - name: REDIS_PORT
               value: "6379"
             - name: REDIS_PASSWORD
@@ -77,6 +77,6 @@ spec:
             - name: REDIS_DB
               value: "0"
             - name: REDIS_SENTINEL_HOSTS
-              value: "stock-redis:26379"
+              value: "stock-redis-sentinel:26379"
             - name: REDIS_MASTER_NAME
-              value: "mymaster"
+              value: "stock-master"

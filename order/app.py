@@ -33,7 +33,7 @@ if _SENTINEL_HOSTS:
         _peers,
         password=_REDIS_PASSWORD,
         db=_REDIS_DB,
-    ).master_for(_REDIS_MASTER_NAME, socket_timeout=0.5)
+    ).master_for(_REDIS_MASTER_NAME, socket_timeout=1.5, retry_on_timeout=True)
 else:
     db: redis.Redis = redis.Redis(
         host=os.environ['REDIS_HOST'],

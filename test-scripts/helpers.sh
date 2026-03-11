@@ -161,12 +161,12 @@ service_start() {
 
 # Crash ALL Redis masters (simulates a full data-store outage / power loss).
 # docker: stops all three per-service masters
-# kube:   deletes node-0 of each bitnami Sentinel StatefulSet; Sentinel promotes node-1
+# kube:   scales master Deployments to 0 (mirrors docker compose stop)
 redis_crash() {
   yellow "Crashing Redis masters..."
   if [ "$DEPLOY_MODE" = "kube" ]; then
-    kubectl delete pod/order-redis-node-0 pod/stock-redis-node-0 pod/payment-redis-node-0 \
-      --grace-period=0 --wait=false > /dev/null 2>&1
+    kubectl scale deployment/order-redis-master deployment/stock-redis-master deployment/payment-redis-master \
+      --replicas=0 > /dev/null 2>&1
   else
     docker compose stop order-redis-master stock-redis-master payment-redis-master > /dev/null 2>&1
   fi
@@ -174,12 +174,14 @@ redis_crash() {
 
 # Restart ALL Redis masters and wait until they are ready (AOF replay complete).
 # docker: starts all three masters (they rejoin as replicas after Sentinel failover)
-# kube:   waits for node-0 pods to become Ready again (they rejoin as replicas)
+# kube:   scales master Deployments back to 1 and waits for Ready
 redis_restore() {
   yellow "Restarting Redis masters (AOF replay on startup)..."
   if [ "$DEPLOY_MODE" = "kube" ]; then
-    kubectl wait pod/order-redis-node-0 pod/stock-redis-node-0 pod/payment-redis-node-0 \
-      --for=condition=Ready --timeout=60s > /dev/null 2>&1
+    kubectl scale deployment/order-redis-master deployment/stock-redis-master deployment/payment-redis-master \
+      --replicas=1 > /dev/null 2>&1
+    kubectl rollout status deployment/order-redis-master deployment/stock-redis-master deployment/payment-redis-master \
+      --timeout=60s > /dev/null 2>&1
   else
     docker compose start order-redis-master stock-redis-master payment-redis-master > /dev/null 2>&1
   fi
@@ -187,25 +189,26 @@ redis_restore() {
 
 # Kill the Redis master for ONE service (Sentinel will promote the replica).
 # docker: stops {svc}-redis-master container
-# kube:   deletes {svc}-redis-node-0 (initial master pod in bitnami Sentinel StatefulSet)
+# kube:   scales {svc}-redis-master Deployment to 0 (mirrors docker compose stop)
 redis_kill_master() {
   local svc="$1"   # "order", "stock", or "payment"
   yellow "Killing $svc Redis master..."
   if [ "$DEPLOY_MODE" = "kube" ]; then
-    kubectl delete pod/${svc}-redis-node-0 --grace-period=0 --wait=false > /dev/null 2>&1
+    kubectl scale deployment/${svc}-redis-master --replicas=0 > /dev/null 2>&1
   else
     docker compose stop ${svc}-redis-master > /dev/null 2>&1
   fi
 }
 
-# Wait for the killed Redis master pod to come back (rejoins as replica).
+# Bring the Redis master back (rejoins as replica after Sentinel failover).
 # docker: starts {svc}-redis-master (Sentinel has already promoted the replica)
-# kube:   waits for {svc}-redis-node-0 to become Ready (StatefulSet recreates it)
+# kube:   scales {svc}-redis-master back to 1 and waits for Ready
 redis_restart_master() {
   local svc="$1"   # "order", "stock", or "payment"
   yellow "Waiting for $svc Redis master pod to rejoin as replica..."
   if [ "$DEPLOY_MODE" = "kube" ]; then
-    kubectl wait pod/${svc}-redis-node-0 --for=condition=Ready --timeout=60s > /dev/null 2>&1
+    kubectl scale deployment/${svc}-redis-master --replicas=1 > /dev/null 2>&1
+    kubectl rollout status deployment/${svc}-redis-master --timeout=60s > /dev/null 2>&1
   else
     docker compose start ${svc}-redis-master > /dev/null 2>&1
   fi
