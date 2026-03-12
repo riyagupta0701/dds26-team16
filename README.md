@@ -100,6 +100,18 @@ A fault-tolerant, distributed e-commerce backend built with Flask microservices,
 Each of the three logical services (order, stock, payment) runs as **2 application replicas** behind a shared Nginx upstream pool. Each service has its own isolated **Redis master + replica** pair for data persistence and replication. The stack totals 16 containers.
 
 
+### Redis Architecture: State vs. Messaging
+
+To ensure reliability and scalability, each service maintains **two distinct connection pools**:
+
+1.  **State Connection (`db`):** Used for persistent business data (e.g., inventory counts, user credits, order status).
+2.  **Messaging Connection (`mq`):** Used for asynchronous communication (Redis Streams, Consumer Groups).
+
+**Key Benefits:**
+*   **Isolation:** High-volume messaging traffic (streams) doesn't block critical database queries.
+*   **Production Readiness:** Allows deploying separate Redis clusters for storage vs. messaging by simply setting `MQ_REDIS_HOST` (e.g. persistent vs volatile).
+*   **Safety:** A memory overflow in the message queue won't trigger eviction of persistent business data.
+
 ## Services
 
 ### Order Service

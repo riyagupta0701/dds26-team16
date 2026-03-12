@@ -26,9 +26,16 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
 
+# Separate connection for Message Queue operations
+# Defaults to the same host as DB, but allows splitting in production
+mq: redis.Redis = redis.Redis(host=os.environ.get('MQ_REDIS_HOST', os.environ['REDIS_HOST']),
+                              port=int(os.environ.get('MQ_REDIS_PORT', os.environ['REDIS_PORT'])),
+                              password=os.environ.get('MQ_REDIS_PASSWORD', os.environ['REDIS_PASSWORD']),
+                              db=int(os.environ.get('MQ_REDIS_DB', os.environ['REDIS_DB'])))
 
 def close_db_connection():
     db.close()
+    mq.close()
 
 
 atexit.register(close_db_connection)
@@ -131,6 +138,16 @@ def find_order(order_id: str):
             "status": order_entry.status
         }
     )
+
+
+@app.get('/health')
+def health_check():
+    try:
+        db.ping()
+        return jsonify({"status": "healthy", "db": "connected"}), 200
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"Health check failed: {e}")
+        return jsonify({"status": "unhealthy", "db": "disconnected"}), 500
 
 # HTTP helpers with retry
 def send_post_request(url: str, retries: int = 3) -> requests.Response | None:
