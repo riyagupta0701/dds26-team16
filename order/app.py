@@ -53,7 +53,7 @@ SAGA_PENDING_KEY = "saga:pending"
 
 class OrderValue(Struct, kw_only=True):
     paid: bool
-    items: list[tuple[str, int]]
+    items: dict[str, int]
     user_id: str
     total_cost: int
     status: str = STATUS_PENDING
@@ -63,40 +63,32 @@ class OrderValue(Struct, kw_only=True):
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
         # get serialized data
-        entry: bytes = db.get(order_id)
+        raw_entry: bytes = db.get(order_id)
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(500, DB_ERROR_STR)
     # deserialize data if it exists else return null
-    entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
+    entry: OrderValue | None = msgpack.decode(raw_entry, type=OrderValue) if raw_entry else None
     if entry is None:
         app.logger.warning("Order entry not found: %s", order_id)
         # if order does not exist in the database; abort
         abort(400, f"Order: {order_id} not found!")
     return entry
 
-def save_order(order_id: str, order: OrderValue):
-    try:
-        db.set(order_id, msgpack.encode(order))
-    except redis.exceptions.RedisError:
-        app.logger.error("Failed to save order: %s", order_id)
-        abort(400, DB_ERROR_STR)
-
-
 # Order endpoints
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
     key = str(uuid.uuid4())
-    value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0, status=STATUS_PENDING))
+    value = msgpack.encode(OrderValue(paid=False, items={}, user_id=user_id, total_cost=0, status=STATUS_PENDING))
     try:
         db.set(key, value)
     except redis.exceptions.RedisError:
         app.logger.error("Failed to save order: %s", key)
-        return abort(400, DB_ERROR_STR)
+        return abort(500, DB_ERROR_STR)
     return jsonify({'order_id': key})
 
 
 @app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
-def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
+def batch_init_orders(n: int, n_items: int, n_users: int, item_price: int):
 
     n = int(n)
     n_items = int(n_items)
@@ -107,8 +99,13 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
         user_id = random.randint(0, n_users - 1)
         item1_id = random.randint(0, n_items - 1)
         item2_id = random.randint(0, n_items - 1)
+        
+        items_dict = defaultdict(int)
+        items_dict[f"{item1_id}"] += 1
+        items_dict[f"{item2_id}"] += 1
+        
         return OrderValue(paid=False,
-                          items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
+                          items=items_dict,
                           user_id=f"{user_id}",
                           total_cost=2 * item_price,
                           status=STATUS_PENDING)
@@ -119,7 +116,7 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
         app.logger.error("Failed to save order: %s", kv_pairs)
-        return abort(400, DB_ERROR_STR)
+        return abort(500, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
 
 
@@ -218,7 +215,7 @@ def add_item(order_id: str, item_id: str, quantity: int):
                     pipe.unwatch()
                     abort(400, f"Order: {order_id} not found!")
                 order_entry = msgpack.decode(raw, type=OrderValue)
-                order_entry.items.append((item_id, int(quantity)))
+                order_entry.items[item_id] = order_entry.items.get(item_id, 0) + int(quantity)
                 order_entry.total_cost += price_per_unit
                 pipe.multi()
                 pipe.set(order_id, msgpack.encode(order_entry))
@@ -230,7 +227,7 @@ def add_item(order_id: str, item_id: str, quantity: int):
         except redis.WatchError:
             continue  # concurrent write detected — retry with fresh state
         except redis.exceptions.RedisError:
-            abort(400, DB_ERROR_STR)
+            abort(500, DB_ERROR_STR)
     abort(400, "Conflict: could not add item after retries")
 
 
@@ -294,11 +291,9 @@ def checkout_saga(order_id: str):
     except redis.exceptions.RedisError:
         abort(500, DB_ERROR_STR)
 
-    # Aggregate quantities across duplicate item entries
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order_entry.items:
-        items_quantities[item_id] += quantity
-
+    # items are already aggregated in a dictionary
+    items_quantities = order_entry.items
+    
     # FORWARD step 1: Reserve Stock (Batch)
     # We send a single event with all items.
     stock_payload = {'items': json.dumps(items_quantities), 'transaction_id': order_id}
@@ -417,32 +412,26 @@ def checkout_2pc(order_id: str):
                 except redis.exceptions.WatchError:
                     continue  # another worker changed the key; re-read and retry
     except redis.exceptions.RedisError:
-        abort(400, DB_ERROR_STR)
+        abort(500, DB_ERROR_STR)
 
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order_entry.items:
-        items_quantities[item_id] += quantity
+    items_quantities = order_entry.items
 
     # ── Phase 1: PREPARE ──────────────────────────────────────────────────────
     # Ask every participant to lock resources and vote yes/no.
     # If any vote NO, abort everything that already prepared.
 
-    prepared_stock: list[tuple[str, int]] = []
-    payment_prepared: bool = False
+    # 1. Prepare Stock (Batch)
+    stock_payload = {'order_id': order_id, 'items': json.dumps(items_quantities)}
+    reply = send_rpc('events:stock', 'prepare_subtract_batch', stock_payload)
+    if reply is None or reply.status_code != 200:
+        _abort_2pc(order_id, order_entry, items_quantities)
+        abort(400, f"2PC prepare failed: {reply.text if reply else REQ_ERROR_STR}")
 
-    for item_id, quantity in items_quantities.items():
-        reply = send_rpc('events:stock', 'prepare_subtract', {'order_id': order_id, 'item_id': item_id, 'amount': quantity})
-        if reply is None or reply.status_code != 200:
-            _abort_2pc(order_id, order_entry, prepared_stock, payment_prepared)
-            abort(400, f"2PC prepare failed: out of stock on item {item_id}" if reply else REQ_ERROR_STR)
-        prepared_stock.append((item_id, quantity))
-
+    # 2. Prepare Payment
     reply = send_rpc('events:payment', 'prepare_pay', {'order_id': order_id, 'user_id': order_entry.user_id, 'amount': order_entry.total_cost})
     if reply is None or reply.status_code != 200:
-        _abort_2pc(order_id, order_entry, prepared_stock, payment_prepared)
+        _abort_2pc(order_id, order_entry, items_quantities)
         abort(400, "2PC prepare failed: user out of credit" if reply else REQ_ERROR_STR)
-
-    payment_prepared = True
 
     # ── Phase 2: COMMIT ───────────────────────────────────────────────────────
     # Durably log the COMMIT decision *first*.  Once STATUS_PAID is persisted,
@@ -456,17 +445,18 @@ def checkout_2pc(order_id: str):
     except redis.exceptions.RedisError:
         # Failed to write commit decision — still safe to abort because no
         # participant has committed yet.
-        _abort_2pc(order_id, order_entry, prepared_stock, payment_prepared)
-        abort(400, DB_ERROR_STR)
+        _abort_2pc(order_id, order_entry, items_quantities)
+        abort(500, DB_ERROR_STR)
 
     # Send COMMIT to all participants (idempotent on their end).
     # Use best-effort sends: STATUS_PAID is already durable, so the client
     # always gets 200 regardless of delivery.  If a send fails, the order stays
     # in the coordinator WAL and recover_2pc() re-drives commits on next startup.
     all_committed = True
-    for item_id, quantity in prepared_stock:
-        if not _recovery_rpc('events:stock', 'commit_subtract', {'order_id': order_id, 'item_id': item_id, 'amount': quantity}):
-            all_committed = False
+    
+    # Commit Stock (Batch)
+    if not _recovery_rpc('events:stock', 'commit_subtract_batch', stock_payload):
+        all_committed = False
 
     if not _recovery_rpc('events:payment', 'commit_pay', {'order_id': order_id, 'user_id': order_entry.user_id, 'amount': order_entry.total_cost}):
         all_committed = False
@@ -486,8 +476,7 @@ def checkout_2pc(order_id: str):
 def _abort_2pc(
     order_id: str,
     order_entry: OrderValue,
-    prepared_stock: list[tuple[str, int]],
-    payment_prepared: bool,
+    items_dict: dict[str, int],
 ):
     """
     Send ABORT to every participant that voted YES, then mark the order FAILED.
@@ -500,20 +489,19 @@ def _abort_2pc(
     delivered successfully.  If any send fails, the order stays in the WAL so
     recover_2pc() can re-drive aborts on the next startup.
     """
-    all_aborted = True
-    for item_id, quantity in prepared_stock:
-        if not _recovery_rpc('events:stock', 'abort_subtract', {'order_id': order_id, 'item_id': item_id, 'amount': quantity}):
-            all_aborted = False
-
-    if payment_prepared:
-        if not _recovery_rpc('events:payment', 'abort_pay', {'order_id': order_id, 'user_id': order_entry.user_id, 'amount': order_entry.total_cost}):
-            all_aborted = False
-
     order_entry.status = STATUS_FAILED
     try:
         db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
         app.logger.error(f"Failed to persist FAILED status for order {order_id}")
+
+    all_aborted = True
+    payload = {'order_id': order_id, 'items': json.dumps(items_dict)}
+    if not _recovery_rpc('events:stock', 'abort_subtract_batch', payload):
+        all_aborted = False
+
+    if not _recovery_rpc('events:payment', 'abort_pay', {'order_id': order_id, 'user_id': order_entry.user_id, 'amount': order_entry.total_cost}):
+        all_aborted = False
 
     if all_aborted:
         try:
@@ -566,17 +554,14 @@ def recover_2pc():
             app.logger.error(f"Recovery: failed to read order {order_id}: {exc}")
             continue
 
-        items_quantities: dict[str, int] = defaultdict(int)
-        for item_id, quantity in order.items:
-            items_quantities[item_id] += quantity
+        items_quantities = order.items
 
         if order.status == STATUS_PAID:
             # Commit decision was durably logged; re-drive COMMITs to all participants.
             app.logger.info(f"Recovery: re-driving COMMIT for order {order_id}")
             all_committed = True
-            for item_id, quantity in items_quantities.items():
-                if not _recovery_rpc('events:stock', 'commit_subtract', {'order_id': order_id, 'item_id': item_id, 'amount': quantity}):
-                    all_committed = False
+            if not _recovery_rpc('events:stock', 'commit_subtract_batch', {'order_id': order_id, 'items': json.dumps(items_quantities)}):
+                all_committed = False
             if not _recovery_rpc('events:payment', 'commit_pay', {'order_id': order_id, 'user_id': order.user_id, 'amount': order.total_cost}):
                 all_committed = False
 
@@ -593,27 +578,20 @@ def recover_2pc():
             # Abort is safe even for participants that never received PREPARE.
             app.logger.info(f"Recovery: re-driving ABORT for order {order_id} (status={order.status})")
             all_aborted = True
-            for item_id, quantity in items_quantities.items():
-                if not _recovery_rpc('events:stock', 'abort_subtract', {'order_id': order_id, 'item_id': item_id, 'amount': quantity}):
-                    all_aborted = False
+            if not _recovery_rpc('events:stock', 'abort_subtract_batch', {'order_id': order_id, 'items': json.dumps(items_quantities)}):
+                all_aborted = False
             if not _recovery_rpc('events:payment', 'abort_pay', {'order_id': order_id, 'user_id': order.user_id, 'amount': order.total_cost}):
                 all_aborted = False
 
-            order.status = STATUS_FAILED
-            status_saved = False
-            try:
-                db.set(order_id, msgpack.encode(order))
-                status_saved = True
-            except redis.exceptions.RedisError:
-                app.logger.error(f"Recovery: failed to persist FAILED for order {order_id}")
-
-            # Only remove from WAL when both the status write and all abort
-            # sends succeeded.  Otherwise leave it for the next recovery pass.
-            if all_aborted and status_saved:
+            if all_aborted:
+                order.status = STATUS_FAILED
                 try:
-                    db.srem(COORD_PENDING_KEY, order_id)
+                    with db.pipeline(transaction=True) as pipe:
+                        pipe.set(order_id, msgpack.encode(order))
+                        pipe.srem(COORD_PENDING_KEY, order_id)
+                        pipe.execute()
                 except redis.exceptions.RedisError:
-                    app.logger.warning(f"Recovery: could not remove {order_id} from WAL")
+                    app.logger.error(f"Recovery: failed to persist FAILED for order {order_id}")
 
     app.logger.info("Recovery: complete")
 
@@ -650,10 +628,8 @@ def recover_saga():
             if order.status == STATUS_STARTED:
                 app.logger.warning(f"Saga Recovery: Order {order_id} found in {order.status}. Blindly firing rollback.")
                 # Re-calculate items dict to pass to rollback
-                items_quantities: dict[str, int] = defaultdict(int)
-                for item_id, quantity in order.items:
-                    items_quantities[item_id] += quantity
-                
+                items_quantities = order.items
+
                 # Fire-and-forget ROLLBACK to Stock Service
                 # We do not use send_rpc because we don't want to wait for a reply.
                 mq.xadd('events:stock', {
@@ -681,12 +657,22 @@ def recover_saga():
 
 def _run_recovery():
     """Run recovery; never raises so a startup failure cannot kill the worker."""
-    try:
-        recover_2pc()
-        recover_saga()
-    except Exception as exc:
-        app.logger.error(f"Recovery failed at startup: {exc}")
 
+    # Attempt to set a key. NX=True means it only succeeds if the key DOES NOT exist.
+    # EX=30 means the lock automatically deletes itself after 30 seconds to prevent deadlocks.
+    lock_acquired = db.set("order_startup_lock", "locked", nx=True, ex=30)
+
+    if lock_acquired:
+        app.logger.info(f"Worker {os.getpid()} acquired the startup lock. Executing WAL recovery...")
+        try:
+            recover_2pc()
+            recover_saga()
+        except Exception as exc:
+            app.logger.error(f"Recovery failed at startup: {exc}")
+        finally:
+            db.delete("order_startup_lock")
+    else:
+        app.logger.info(f"Worker {os.getpid()} skipping recovery (another worker is handling it).")
 
 if __name__ == '__main__':
     _run_recovery()
