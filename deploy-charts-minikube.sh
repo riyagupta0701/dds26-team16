@@ -7,8 +7,9 @@ docker build -t order:latest ./order
 docker build -t stock:latest ./stock
 docker build -t payment:latest ./payment
 
-# 2. Enable the minikube ingress addon
+# 2. Enable the minikube ingress addon and wait for the controller to be ready
 minikube addons enable ingress
+kubectl rollout status deployment/ingress-nginx-controller -n ingress-nginx --timeout=120s
 
 # 3. Create configmap for internal nginx gateway
 kubectl create configmap gateway-nginx-conf \

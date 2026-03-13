@@ -25,12 +25,19 @@ _REDIS_MASTER_NAME = os.environ.get('REDIS_MASTER_NAME', 'mymaster')
 
 if _SENTINEL_HOSTS:
     from redis.sentinel import Sentinel as _Sentinel
+    from redis.retry import Retry
+    from redis.backoff import NoBackoff
     _peers = [(h.split(':')[0], int(h.split(':')[1])) for h in _SENTINEL_HOSTS.split(',')]
     db: redis.Redis = _Sentinel(
         _peers,
         password=_REDIS_PASSWORD,
         db=_REDIS_DB,
-    ).master_for(_REDIS_MASTER_NAME, socket_timeout=1.5, retry_on_timeout=True)
+    ).master_for(
+        _REDIS_MASTER_NAME,
+        socket_timeout=1.5,
+        retry=Retry(NoBackoff(), 3),
+        retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
+    )
 else:
     db: redis.Redis = redis.Redis(
         host=os.environ['REDIS_HOST'],

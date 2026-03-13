@@ -22,7 +22,7 @@ commonConfiguration: |-
 sentinel:
   enabled: true
   masterSet: mymaster
-  quorum: 1
+  quorum: 2
   downAfterMilliseconds: 5000
   failoverTimeout: 10000
 

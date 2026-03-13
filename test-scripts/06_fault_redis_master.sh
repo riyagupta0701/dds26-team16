@@ -17,18 +17,19 @@ seed_data
 SERVICES=("order" "stock" "payment")
 
 # Wait for Sentinel failover to complete for the affected service.
-# Polls a service-specific endpoint until it stops returning HTTP 400 (DB error):
-#   stock   → GET  /stock/find/0            (200 when up, 400 when Redis down)
-#   payment → POST /payment/create_user     (200 when up, 400 when Redis down)
-#   order   → POST /orders/create/probe-id  (200 when up, 400 when Redis down)
+# Polls a read-only endpoint until it returns 200 (Redis up) instead of 400 (DB error).
+# All probes are read-only — they use data seeded by seed_data and write nothing:
+#   stock   → GET /stock/find/0    (item 0 created by batch_init)
+#   payment → GET /payment/find/0  (user 0 created by batch_init)
+#   order   → GET /orders/find/0   (order 0 created by batch_init)
 _wait_for_recovery() {
   local svc="$1"
   yellow "Polling until $svc Redis recovers from Sentinel failover..."
   for i in $(seq 1 30); do
     case "$svc" in
       stock)   _c=$(get_code "/stock/find/0") ;;
-      payment) _c=$(post "/payment/create_user") ;;
-      order)   _c=$(post "/orders/create/probe-id") ;;
+      payment) _c=$(get_code "/payment/find_user/0") ;;
+      order)   _c=$(get_code "/orders/find/0") ;;
     esac
     if [ "$_c" = "200" ]; then
       green "$svc service recovered after Sentinel failover"

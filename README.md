@@ -278,6 +278,7 @@ DEPLOY_MODE=kube BASE_URL=http://localhost:8080 bash test-scripts/run_all.sh
 ```bash
 kubectl delete -f k8s/
 kubectl delete configmap gateway-nginx-conf
+kubectl delete pvc order-master-data order-replica-data stock-master-data stock-replica-data payment-master-data payment-replica-data
 ```
 
 Or to destroy the entire minikube cluster:

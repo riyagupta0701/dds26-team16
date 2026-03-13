@@ -31,7 +31,7 @@ services:
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
       order-redis-sentinel:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
 
   order-service-2:
@@ -49,7 +49,7 @@ services:
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
       order-redis-sentinel:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
 
   order-redis-master:
@@ -88,6 +88,11 @@ services:
         echo 'sentinel parallel-syncs order-master 1' >> /tmp/sentinel.conf &&
         redis-server /tmp/sentinel.conf --sentinel --port 26379
       "
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
     depends_on:
       order-redis-master:
         condition: service_healthy
@@ -107,7 +112,7 @@ services:
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
       stock-redis-sentinel:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
 
   stock-service-2:
@@ -123,7 +128,7 @@ services:
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
       stock-redis-sentinel:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
 
   stock-redis-master:
@@ -162,6 +167,11 @@ services:
         echo 'sentinel parallel-syncs stock-master 1' >> /tmp/sentinel.conf &&
         redis-server /tmp/sentinel.conf --sentinel --port 26379
       "
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
     depends_on:
       stock-redis-master:
         condition: service_healthy
@@ -181,7 +191,7 @@ services:
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
       payment-redis-sentinel:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
 
   payment-service-2:
@@ -197,7 +207,7 @@ services:
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
       payment-redis-sentinel:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
 
   payment-redis-master:
@@ -236,6 +246,11 @@ services:
         echo 'sentinel parallel-syncs payment-master 1' >> /tmp/sentinel.conf &&
         redis-server /tmp/sentinel.conf --sentinel --port 26379
       "
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
     depends_on:
       payment-redis-master:
         condition: service_healthy
