@@ -103,7 +103,7 @@ def create_item_logic(price: int):
     try:
         db.set(key, value)
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
     return response_success({'item_id': key})
 
 def batch_init_logic(n: int, starting_stock: int, item_price: int):
@@ -115,14 +115,14 @@ def batch_init_logic(n: int, starting_stock: int, item_price: int):
     try:
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
     return response_success({"msg": "Batch init for stock successful"})
 
 def find_item_logic(item_id: str):
     try:
         item_entry: StockValue = get_item_from_db(item_id)
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
     if item_entry is None:
         return response_error(f"Item: {item_id} not found!", 400)
     return response_success({
@@ -152,7 +152,7 @@ def add_stock_logic(item_id: str, amount: int):
         except redis.WatchError:
             continue
         except redis.exceptions.RedisError:
-            return response_error(DB_ERROR_STR)
+            return response_error(DB_ERROR_STR, 500)
     return response_error("Conflict: could not update stock after retries")
 
 def remove_stock_logic(item_id: str, amount: int):
@@ -186,7 +186,7 @@ def remove_stock_logic(item_id: str, amount: int):
         except redis.WatchError:
             continue
         except redis.exceptions.RedisError:
-            return response_error(DB_ERROR_STR)
+            return response_error(DB_ERROR_STR, 500)
     return response_error("Conflict: could not subtract stock after retries")
 
 def add_stock_batch_logic(items_json: str, transaction_id: str | None = None):
@@ -226,18 +226,13 @@ def add_stock_batch_logic(items_json: str, transaction_id: str | None = None):
                     pipe.watch(*keys)
                 
                 current_values = {}
-                missing_item = None
-                
+
                 for key in keys:
                     raw = pipe.get(key)
                     if raw is None:
-                        missing_item = key
-                        break
+                        pipe.unwatch()
+                        return response_error(f"Item: {key} not found!")
                     current_values[key] = msgpack.decode(raw, type=StockValue)
-                
-                if missing_item:
-                    pipe.unwatch()
-                    return response_error(f"Item: {missing_item} not found!")
 
                 pipe.multi()
                 for key, amount in items.items():
@@ -251,7 +246,7 @@ def add_stock_batch_logic(items_json: str, transaction_id: str | None = None):
         except redis.WatchError:
             continue
         except redis.exceptions.RedisError:
-            return response_error(DB_ERROR_STR)
+            return response_error(DB_ERROR_STR, 500)
     return response_error("Conflict: could not update stock batch after retries")
 
 def subtract_stock_batch_logic(items_json: str, transaction_id: str | None = None):
@@ -286,33 +281,22 @@ def subtract_stock_batch_logic(items_json: str, transaction_id: str | None = Non
                 
                 current_values = {}
                 current_reserved = {}
-                missing_item = None
-                insufficient_item = None
                 
                 for key in keys:
                     raw = pipe.get(key)
                     if raw is None:
-                        missing_item = key
-                        break
+                        pipe.unwatch()
+                        return response_error(f"Item: {key} not found!")
                     current_values[key] = msgpack.decode(raw, type=StockValue)
                     
                     r_key = _stock_reserved_key(key)
                     res_val = pipe.get(r_key)
                     current_reserved[key] = int(res_val or 0)
-                
-                if missing_item:
-                    pipe.unwatch()
-                    return response_error(f"Item: {missing_item} not found!")
 
-                for key, amount in items.items():
                     entry = current_values[key]
                     if entry.stock - int(amount) < current_reserved[key]:
-                        insufficient_item = key
-                        break
-                
-                if insufficient_item:
-                    pipe.unwatch()
-                    return response_error(f"Item: {insufficient_item} insufficient stock/reserved conflict")
+                        pipe.unwatch()
+                        return response_error(f"Item: {key} insufficient stock/reserved conflict")
 
                 pipe.multi()
                 for key, amount in items.items():
@@ -326,7 +310,7 @@ def subtract_stock_batch_logic(items_json: str, transaction_id: str | None = Non
         except redis.WatchError:
             continue
         except redis.exceptions.RedisError:
-            return response_error(DB_ERROR_STR)
+            return response_error(DB_ERROR_STR, 500)
     return response_error("Conflict: could not subtract stock batch after retries")
 
 
@@ -341,184 +325,185 @@ def subtract_stock_batch_logic(items_json: str, transaction_id: str | None = Non
 # All three endpoints use WATCH/MULTI/EXEC for optimistic concurrency control so
 # multiple gunicorn workers never corrupt each other's reads and writes.
 
-def _stock_wal_key(order_id: str, item_id: str) -> str:
-    return f"2pc:stock:{order_id}:{item_id}"
+def _stock_wal_key(order_id: str) -> str:
+    return f"2pc:stock:{order_id}"
 
 
 def _stock_reserved_key(item_id: str) -> str:
     return f"reserved:stock:{item_id}"
 
-def prepare_subtract_logic(order_id: str, item_id: str, amount: int):
+def prepare_subtract_batch_logic(order_id: str, items_json: str):
     """
-    2PC Phase 1 – PREPARE (participant: stock).
-
-    Atomically checks that item_id has enough unreserved stock, then
-    soft-reserves `amount` units and records a WAL entry so the decision
-    survives participant crashes.
-
-    Idempotent: a duplicate call for the same (order_id, item_id) returns 200.
+    2PC Phase 1 – PREPARE BATCH (participant: stock).
+    Atomically checks availability and reserves stock for all items in the batch.
     """
-    amount = int(amount)
-    wal_key      = _stock_wal_key(order_id, item_id)
-    reserved_key = _stock_reserved_key(item_id)
-
     try:
-        with db.pipeline() as pipe:
-            while True:
-                try:
-                    # WATCH the three keys involved so any concurrent write
-                    # causes our EXEC to fail and we retry.
-                    pipe.watch(item_id, reserved_key, wal_key)
+        items: dict[str, int] = json.loads(items_json)
+    except json.JSONDecodeError:
+        return response_error("Invalid JSON format for items")
 
-                    # ── Idempotency check ──────────────────────────────────
-                    wal_state = pipe.get(wal_key)
-                    if wal_state in (WAL_PREPARED, WAL_COMMITTED):
-                        pipe.unwatch()
-                        return response_success("Prepare: already done")
-                    if wal_state == WAL_ABORTED:
-                        pipe.unwatch()
-                        return response_error(f"Transaction {order_id} already aborted for item {item_id}")
+    keys = list(items.keys())
+    wal_key = _stock_wal_key(order_id)
+    reserved_keys = {k: _stock_reserved_key(k) for k in keys}
 
-                    # ── Availability check ─────────────────────────────────
-                    raw = pipe.get(item_id)
+    # Watch all involved keys
+    watch_keys = keys + list(reserved_keys.values()) + [wal_key]
+
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(*watch_keys)
+
+                # ── Idempotency check ──────────────────────────────────
+                # If all are already prepared/committed, return success.
+                # If any is aborted, fail.
+                wal_state = pipe.get(wal_key)
+                if wal_state == WAL_ABORTED:
+                    pipe.unwatch()
+                    return response_error(f"Transaction {order_id} already aborted")
+
+                if wal_state in (WAL_PREPARED, WAL_COMMITTED):
+                    pipe.unwatch()
+                    return response_success("Prepare batch: already done")
+
+                # ── Availability check ─────────────────────────────────
+                current_reserved = {}
+                for k, amount in items.items():
+                    raw = pipe.get(k)
                     if not raw:
                         pipe.unwatch()
-                        return response_error(f"Item: {item_id} not found!")
-                    item      = msgpack.decode(raw, type=StockValue)
-                    reserved  = int(pipe.get(reserved_key) or 0)
-                    available = item.stock - reserved
+                        return response_error(f"Item: {k} not found!")
+                    item = msgpack.decode(raw, type=StockValue)
+                    res_val = pipe.get(reserved_keys[k])
+                    current_reserved[k] = int(res_val or 0)
+                    available = item.stock - current_reserved[k]
 
-                    if available < amount:
+                    if available < int(amount):
                         pipe.unwatch()
-                        return response_error(f"Insufficient stock for item {item_id}: "
-                                   f"available={available}, requested={amount}")
+                        return response_error(f"Insufficient stock for item {k}")
 
-                    # ── Atomic soft-reserve + WAL ──────────────────────────
-                    pipe.multi()
-                    pipe.set(reserved_key, reserved + amount)
-                    pipe.set(wal_key, WAL_PREPARED)
-                    pipe.execute()
-                    break  # success
+                # ── Atomic soft-reserve + WAL ──────────────────────────
+                pipe.multi()
+                for k, amount in items.items():
+                    pipe.set(reserved_keys[k], current_reserved[k] + int(amount))
+                pipe.set(wal_key, WAL_PREPARED)
+                pipe.execute()
+                return response_success("Prepare batch: OK")
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return response_error(DB_ERROR_STR, 500)
+    return response_error("Conflict: could not prepare batch after retries")
 
-                except redis.WatchError:
-                    continue  # a concurrent writer touched a watched key; retry
-
-    except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
-
-    app.logger.debug(f"2PC prepare OK  order={order_id} item={item_id} qty={amount}")
-    return response_success("Prepare: OK")
-
-def commit_subtract_logic(order_id: str, item_id: str, amount: int):
+def commit_subtract_batch_logic(order_id: str, items_json: str):
     """
-    2PC Phase 2 – COMMIT (participant: stock).
-
-    Permanently deducts `amount` from item stock and releases the soft-
-    reservation.  Safe to call multiple times (idempotent via WAL).
+    2PC Phase 2 – COMMIT BATCH (participant: stock).
     """
-    amount = int(amount)
-    wal_key      = _stock_wal_key(order_id, item_id)
-    reserved_key = _stock_reserved_key(item_id)
-
     try:
-        with db.pipeline() as pipe:
-            while True:
-                try:
-                    pipe.watch(item_id, reserved_key, wal_key)
+        items: dict[str, int] = json.loads(items_json)
+    except json.JSONDecodeError:
+        return response_error("Invalid JSON format for items")
 
-                    wal_state = pipe.get(wal_key)
-                    if wal_state == WAL_COMMITTED:
-                        pipe.unwatch()
-                        return response_success("Commit: already done")
-                    if wal_state == WAL_ABORTED:
-                        pipe.unwatch()
-                        return response_error(f"Cannot commit: transaction {order_id} was aborted for item {item_id}")
+    keys = list(items.keys())
+    wal_key = _stock_wal_key(order_id)
+    reserved_keys = {k: _stock_reserved_key(k) for k in keys}
+    watch_keys = keys + list(reserved_keys.values()) + [wal_key]
 
-                    # WAL_PREPARED (or None on coordinator recovery re-drive)
-                    raw = pipe.get(item_id)
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(*watch_keys)
+
+                wal_state = pipe.get(wal_key)
+                if wal_state == WAL_ABORTED:
+                    pipe.unwatch()
+                    return response_error(f"Cannot commit: transaction {order_id} aborted")
+
+                if wal_state == WAL_COMMITTED:
+                    pipe.unwatch()
+                    return response_success("Commit batch: already done")
+
+                current_reserved = {}
+
+                for k, amount in items.items():
+                    raw = pipe.get(k)
                     if not raw:
                         pipe.unwatch()
-                        return response_error(f"Item: {item_id} not found!")
-                    item      = msgpack.decode(raw, type=StockValue)
-                    reserved  = int(pipe.get(reserved_key) or 0)
+                        return response_error(f"Item: {k} not found!")
+                    res_val = pipe.get(reserved_keys[k])
+                    current_reserved[k] = int(res_val or 0)
 
-                    new_stock    = item.stock - amount
-                    new_reserved = max(0, reserved - amount)
-
-                    if new_stock < 0:
+                pipe.multi()
+                for k, amount in items.items():
+                    item = msgpack.decode(raw, type=StockValue)
+                    item.stock -= int(amount)
+                    if item.stock < 0:
                         # The coordinator has already durably logged COMMIT, so
                         # we must commit regardless.  This path should be
-                        # unreachable now that /subtract checks reservations, but
-                        # if something bypassed the reservation, log and proceed.
+                        # unreachable, but if
+                        # something bypassed the reservation, log and proceed.
                         app.logger.error(
-                            f"2PC commit: stock underflow for item {item_id} order {order_id} "
-                            f"(stock={item.stock}, reserved={reserved}, amount={amount}). "
+                            f"2PC commit: stock underflow for item {k} order {order_id} "
+                            f"(stock={item.stock}, reserved={current_reserved[k]}, amount={amount}). "
                             f"Committing anyway to preserve 2PC durability."
                         )
+                    new_reserved = max(0, current_reserved[k] - int(amount))
 
-                    item.stock = new_stock
+                    pipe.set(k, msgpack.encode(item))
+                    pipe.set(reserved_keys[k], new_reserved)
+                pipe.set(wal_key, WAL_COMMITTED)
+                pipe.execute()
+                return response_success("Commit batch: OK")
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return response_error(DB_ERROR_STR, 500)
+    return response_error("Conflict: could not commit batch after retries")
 
-                    pipe.multi()
-                    pipe.set(item_id, msgpack.encode(item))
-                    pipe.set(reserved_key, new_reserved)
-                    pipe.set(wal_key, WAL_COMMITTED)
-                    pipe.execute()
-                    break
-
-                except redis.WatchError:
-                    continue
-
-    except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
-
-    app.logger.debug(f"2PC commit OK   order={order_id} item={item_id} qty={amount}")
-    return response_success("Commit: OK")
-
-def abort_subtract_logic(order_id: str, item_id: str, amount: int):
+def abort_subtract_batch_logic(order_id: str, items_json: str):
     """
-    2PC Phase 2 – ABORT (participant: stock).
-
-    Releases the soft-reservation without touching actual stock.
-    Safe to call even if prepare was never received (WAL=None → no-op).
-    Idempotent: calling twice returns 200 both times.
+    2PC Phase 2 – ABORT BATCH (participant: stock).
     """
-    amount = int(amount)
-    wal_key      = _stock_wal_key(order_id, item_id)
-    reserved_key = _stock_reserved_key(item_id)
-
     try:
-        with db.pipeline() as pipe:
-            while True:
-                try:
-                    pipe.watch(reserved_key, wal_key)
+        items: dict[str, int] = json.loads(items_json)
+    except json.JSONDecodeError:
+        return response_error("Invalid JSON format for items")
 
-                    wal_state = pipe.get(wal_key)
-                    if wal_state == WAL_ABORTED or wal_state is None:
-                        # Already aborted or never prepared — nothing to release.
-                        pipe.unwatch()
-                        return response_success("Abort: already done or not prepared")
-                    if wal_state == WAL_COMMITTED:
-                        pipe.unwatch()
-                        return response_error(f"Cannot abort: transaction {order_id} already committed for item {item_id}")
+    keys = list(items.keys())
+    wal_key = _stock_wal_key(order_id)
+    reserved_keys = {k: _stock_reserved_key(k) for k in keys}
+    watch_keys = list(reserved_keys.values()) + [wal_key]
 
-                    # WAL_PREPARED: release the reservation.
-                    reserved     = int(pipe.get(reserved_key) or 0)
-                    new_reserved = max(0, reserved - amount)
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(*watch_keys)
 
+                wal_state = pipe.get(wal_key)
+                if wal_state == WAL_COMMITTED:
+                    pipe.unwatch()
+                    return response_error(f"Cannot abort: transaction {order_id}, already committed")
+                elif wal_state != WAL_ABORTED:
+                    current_reserved = {}
+                    for k, amount in items.items():
+                        raw = pipe.get(k)
+                        if not raw:
+                            pipe.unwatch()
+                            return response_error(f"Item: {k} not found!")
+                        res_val = pipe.get(reserved_keys[k])
+                        current_reserved[k] = int(res_val or 0)
                     pipe.multi()
-                    pipe.set(reserved_key, new_reserved)
                     pipe.set(wal_key, WAL_ABORTED)
+                    for k, amount in items.items():
+                        new_reserved = max(0, current_reserved[k] - int(amount))
+                        pipe.set(reserved_keys[k], new_reserved)
                     pipe.execute()
-                    break
-
-                except redis.WatchError:
-                    continue
-
-    except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
-
-    return response_success("Abort: OK")
-
+                return response_success("Abort batch: OK")
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return response_error(DB_ERROR_STR, 500)
+    return response_error("Conflict: could not abort batch after retries")
 
 # ─── Flask Routes (Wrappers) ──────────────────────────────────────────────────
 
@@ -547,22 +532,6 @@ def remove_stock(item_id: str, amount: int):
     res = remove_stock_logic(item_id, amount)
     return Response(res['body'], status=200) if res['status_code'] == 200 else abort(res['status_code'], res.get('error'))
 
-@app.post('/prepare_subtract/<order_id>/<item_id>/<amount>')
-def prepare_subtract(order_id: str, item_id: str, amount: int):
-    res = prepare_subtract_logic(order_id, item_id, amount)
-    return Response(res['body'], status=200) if res['status_code'] == 200 else abort(res['status_code'], res.get('error'))
-
-@app.post('/commit_subtract/<order_id>/<item_id>/<amount>')
-def commit_subtract(order_id: str, item_id: str, amount: int):
-    res = commit_subtract_logic(order_id, item_id, amount)
-    return Response(res['body'], status=200) if res['status_code'] == 200 else abort(res['status_code'], res.get('error'))
-
-@app.post('/abort_subtract/<order_id>/<item_id>/<amount>')
-def abort_subtract(order_id: str, item_id: str, amount: int):
-    res = abort_subtract_logic(order_id, item_id, amount)
-    return Response(res['body'], status=200) if res['status_code'] == 200 else abort(res['status_code'], res.get('error'))
-
-
 @app.get('/health')
 def health_check():
     try:
@@ -573,13 +542,12 @@ def health_check():
         app.logger.error(f"Health check failed: {e}")
         return jsonify({"status": "unhealthy", "db": "disconnected", "mq": "disconnected"}), 500
 
-
 # ─── Message Queue Listener ───────────────────────────────────────────────────
 
 def run_event_listener():
     stream_key = 'events:stock'
     group_name = 'stock_group'
-    consumer_name = f"stock_consumer_{uuid.uuid4()}"
+    consumer_name = f"stock_consumer_{os.environ.get('HOSTNAME', 'local')}"
 
     try:
         mq.xgroup_create(stream_key, group_name, mkstream=True)
@@ -593,7 +561,7 @@ def run_event_listener():
     while True:
         try:
             # Read new messages from the group
-            streams = mq.xreadgroup(group_name, consumer_name, {stream_key: '>'}, count=1, block=5000)
+            streams = mq.xreadgroup(group_name, consumer_name, {stream_key: '>'}, count=1, block=5000, noack=True)
             
             if not streams:
                 continue
@@ -625,20 +593,17 @@ def run_event_listener():
                         elif msg_type == 'subtract_stock_batch':
                             tx_id = payload.get('transaction_id')
                             result = subtract_stock_batch_logic(payload['items'], tx_id)
-                        elif msg_type == 'prepare_subtract':
-                            result = prepare_subtract_logic(payload['order_id'], payload['item_id'], int(payload['amount']))
-                        elif msg_type == 'commit_subtract':
-                            result = commit_subtract_logic(payload['order_id'], payload['item_id'], int(payload['amount']))
-                        elif msg_type == 'abort_subtract':
-                            result = abort_subtract_logic(payload['order_id'], payload['item_id'], int(payload['amount']))
+                        elif msg_type == 'prepare_subtract_batch':
+                            result = prepare_subtract_batch_logic(payload['order_id'], payload['items'])
+                        elif msg_type == 'commit_subtract_batch':
+                            result = commit_subtract_batch_logic(payload['order_id'], payload['items'])
+                        elif msg_type == 'abort_subtract_batch':
+                            result = abort_subtract_batch_logic(payload['order_id'], payload['items'])
                         
                         # Push response if reply_to is present
                         if reply_to:
                             mq.rpush(reply_to, json.dumps(result))
                             mq.expire(reply_to, 60) # Set TTL for reply list
-
-                        # Acknowledge the message
-                        mq.xack(stream_key, group_name, message_id)
 
                     except Exception as e:
                         app.logger.error(f"Error processing MQ message {message_id}: {e}")
@@ -647,9 +612,6 @@ def run_event_listener():
                              error_res = response_error(f"Internal processing error: {str(e)}", 500)
                              mq.rpush(reply_to, json.dumps(error_res))
                              mq.expire(reply_to, 60)
-                        # We still ack to prevent poison pills from looping forever, 
-                        # or we could implement a dead-letter queue mechanism.
-                        mq.xack(stream_key, group_name, message_id)
 
         except Exception as e:
             app.logger.error(f"MQ Listener loop error: {e}")

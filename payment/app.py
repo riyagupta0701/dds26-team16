@@ -85,9 +85,9 @@ def response_error(error_msg, status_code=400):
 
 def get_user_from_db(user_id: str) -> UserValue | None:
     # get serialized data; let RedisError propagate
-    entry: bytes = db.get(user_id)
+    raw_entry: bytes = db.get(user_id)
     # deserialize data if it exists else return null
-    entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
+    entry: UserValue | None = msgpack.decode(raw_entry, type=UserValue) if raw_entry else None
     return entry
 
 def _payment_tx_key(tx_id: str) -> str:
@@ -101,7 +101,7 @@ def create_user_logic():
     try:
         db.set(key, value)
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
     return response_success({'user_id': key})
 
 def batch_init_logic(n: int, starting_money: int):
@@ -112,14 +112,14 @@ def batch_init_logic(n: int, starting_money: int):
     try:
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
     return response_success({"msg": "Batch init for users successful"})
 
 def find_user_logic(user_id: str):
     try:
         user_entry: UserValue = get_user_from_db(user_id)
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
     if user_entry is None:
         return response_error(f"User: {user_id} not found!", 400)
     return response_success({
@@ -174,7 +174,7 @@ def add_credit_logic(user_id: str, amount: int, transaction_id: str | None = Non
         except redis.WatchError:
             continue
         except redis.exceptions.RedisError:
-            return response_error(DB_ERROR_STR)
+            return response_error(DB_ERROR_STR, 500)
     return response_error("Conflict: could not update credit after retries")
 
 def remove_credit_logic(user_id: str, amount: int, transaction_id: str | None = None):
@@ -226,7 +226,7 @@ def remove_credit_logic(user_id: str, amount: int, transaction_id: str | None = 
         except redis.WatchError:
             continue
         except redis.exceptions.RedisError:
-            return response_error(DB_ERROR_STR)
+            return response_error(DB_ERROR_STR, 500)
     return response_error("Conflict: could not deduct credit after retries")
 
 
@@ -301,7 +301,7 @@ def prepare_pay_logic(order_id: str, user_id: str, amount: int):
                     continue  # concurrent writer; retry
 
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
 
     app.logger.debug(f"2PC prepare OK  order={order_id} user={user_id} amount={amount}")
     return response_success("Prepare: OK")
@@ -366,7 +366,7 @@ def commit_pay_logic(order_id: str, user_id: str, amount: int):
                     continue
 
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
 
     app.logger.debug(f"2PC commit OK   order={order_id} user={user_id} amount={amount}")
     return response_success("Commit: OK")
@@ -412,7 +412,7 @@ def abort_pay_logic(order_id: str, user_id: str, amount: int):
                     continue
 
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
 
     return response_success("Abort: OK")
 
@@ -476,7 +476,7 @@ def health_check():
 def run_event_listener():
     stream_key = 'events:payment'
     group_name = 'payment_group'
-    consumer_name = f"payment_consumer_{uuid.uuid4()}"
+    consumer_name = f"payment_consumer_{os.environ.get('HOSTNAME', 'local')}"
 
     try:
         mq.xgroup_create(stream_key, group_name, mkstream=True)
@@ -489,7 +489,7 @@ def run_event_listener():
 
     while True:
         try:
-            streams = mq.xreadgroup(group_name, consumer_name, {stream_key: '>'}, count=1, block=5000)
+            streams = mq.xreadgroup(group_name, consumer_name, {stream_key: '>'}, count=1, block=5000, noack=True)
             
             if not streams:
                 continue
@@ -527,15 +527,12 @@ def run_event_listener():
                             mq.rpush(reply_to, json.dumps(result))
                             mq.expire(reply_to, 60)
 
-                        mq.xack(stream_key, group_name, message_id)
-
                     except Exception as e:
                         app.logger.error(f"Error processing MQ message {message_id}: {e}")
                         if reply_to:
                              error_res = response_error(f"Internal processing error: {str(e)}", 500)
                              mq.rpush(reply_to, json.dumps(error_res))
                              mq.expire(reply_to, 60)
-                        mq.xack(stream_key, group_name, message_id)
 
         except Exception as e:
             app.logger.error(f"MQ Listener loop error: {e}")
