@@ -18,6 +18,9 @@ WAL_PREPARED  = b"prepared"
 WAL_COMMITTED = b"committed"
 WAL_ABORTED   = b"aborted"
 
+TX_CHARGED = b"CHARGED"
+TX_REFUNDED = b"REFUNDED"
+
 app = Flask("payment-service")
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
@@ -60,6 +63,9 @@ def get_user_from_db(user_id: str) -> UserValue | None:
     entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
     return entry
 
+def _payment_tx_key(tx_id: str) -> str:
+    return f"payment:tx:{tx_id}"
+
 # ─── Business Logic (Decoupled) ───────────────────────────────────────────────
 
 def create_user_logic():
@@ -94,16 +100,38 @@ def find_user_logic(user_id: str):
         "credit": user_entry.credit
     })
 
-def add_credit_logic(user_id: str, amount: int):
+def add_credit_logic(user_id: str, amount: int, transaction_id: str | None = None):
     """
     Idempotency: uses a Redis WATCH/MULTI/EXEC optimistic lock so concurrent
     retries from the benchmark cannot double-add funds.
+    If transaction_id is provided (Refund/Rollback), implements Tombstone pattern.
     """
     amount = int(amount)
+    tx_key = _payment_tx_key(transaction_id) if transaction_id else None
+
     for _ in range(10):  # retry loop for optimistic lock
         try:
             with db.pipeline() as pipe:
-                pipe.watch(user_id)
+                if tx_key:
+                    pipe.watch(user_id, tx_key)
+                    state = pipe.get(tx_key)
+                    
+                    if state == TX_CHARGED:
+                        # Valid refund: Proceed to add funds back
+                        pass
+                    elif state == TX_REFUNDED:
+                        pipe.unwatch()
+                        return response_success("Refund already processed (idempotent)")
+                    else:
+                        # Tombstone: Original charge never happened or is delayed.
+                        # Mark as REFUNDED to prevent future charges.
+                        pipe.multi()
+                        pipe.set(tx_key, TX_REFUNDED)
+                        pipe.execute()
+                        return response_success("Refund tombstone set (charge never happened)")
+                else:
+                    pipe.watch(user_id)
+
                 raw = pipe.get(user_id)
                 if raw is None:
                     pipe.reset()
@@ -112,6 +140,8 @@ def add_credit_logic(user_id: str, amount: int):
                 pipe.multi()
                 user_entry.credit += amount
                 pipe.set(user_id, msgpack.encode(user_entry))
+                if tx_key:
+                    pipe.set(tx_key, TX_REFUNDED)
                 pipe.execute()
                 return response_success(f"User: {user_id} credit updated to: {user_entry.credit}")
         except redis.WatchError:
@@ -120,19 +150,35 @@ def add_credit_logic(user_id: str, amount: int):
             return response_error(DB_ERROR_STR)
     return response_error("Conflict: could not update credit after retries")
 
-def remove_credit_logic(user_id: str, amount: int):
+def remove_credit_logic(user_id: str, amount: int, transaction_id: str | None = None):
     """
     Atomically deduct credit using optimistic locking.
     Respects 2PC soft-reservations: only unreserved credit may be deducted.
     Returns 400 if credit would fall below the currently reserved amount.
+    If transaction_id is provided (Charge), implements Tombstone pattern.
     """
     amount = int(amount)
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
     reserved_key = _payment_reserved_key(user_id)
+    tx_key = _payment_tx_key(transaction_id) if transaction_id else None
+
     for _ in range(10):
         try:
             with db.pipeline() as pipe:
-                pipe.watch(user_id, reserved_key)
+                watch_keys = [user_id, reserved_key]
+                if tx_key:
+                    watch_keys.append(tx_key)
+                pipe.watch(*watch_keys)
+
+                if tx_key:
+                    state = pipe.get(tx_key)
+                    if state == TX_REFUNDED:
+                        pipe.unwatch()
+                        return response_success("Ignored charge (rolled back via tombstone)")
+                    if state == TX_CHARGED:
+                        pipe.unwatch()
+                        return response_success("Already charged (idempotent)")
+
                 raw = pipe.get(user_id)
                 if raw is None:
                     pipe.unwatch()
@@ -146,6 +192,8 @@ def remove_credit_logic(user_id: str, amount: int):
                 pipe.multi()
                 user_entry.credit -= amount
                 pipe.set(user_id, msgpack.encode(user_entry))
+                if tx_key:
+                    pipe.set(tx_key, TX_CHARGED)
                 pipe.execute()
                 return response_success(f"User: {user_id} credit updated to: {user_entry.credit}")
         except redis.WatchError:
@@ -422,9 +470,11 @@ def run_event_listener():
                         elif msg_type == 'find_user':
                             result = find_user_logic(payload['user_id'])
                         elif msg_type == 'add_credit':
-                            result = add_credit_logic(payload['user_id'], int(payload['amount']))
+                            tx_id = payload.get('transaction_id')
+                            result = add_credit_logic(payload['user_id'], int(payload['amount']), tx_id)
                         elif msg_type == 'pay': # Mapped to remove_credit logic
-                            result = remove_credit_logic(payload['user_id'], int(payload['amount']))
+                            tx_id = payload.get('transaction_id')
+                            result = remove_credit_logic(payload['user_id'], int(payload['amount']), tx_id)
                         elif msg_type == 'prepare_pay':
                             result = prepare_pay_logic(payload['order_id'], payload['user_id'], int(payload['amount']))
                         elif msg_type == 'commit_pay':
