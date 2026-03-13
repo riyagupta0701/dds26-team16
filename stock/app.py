@@ -19,6 +19,9 @@ WAL_PREPARED  = b"prepared"
 WAL_COMMITTED = b"committed"
 WAL_ABORTED   = b"aborted"
 
+TX_DEDUCTED = b"DEDUCTED"
+TX_ROLLED_BACK = b"ROLLED_BACK"
+
 app = Flask("stock-service")
 
 _REDIS_PASSWORD    = os.environ.get('REDIS_PASSWORD', '')
@@ -88,6 +91,9 @@ def get_item_from_db(item_id: str) -> StockValue | None:
     # deserialize data if it exists else return null
     entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
     return entry
+
+def _stock_tx_key(tx_id: str) -> str:
+    return f"stock:tx:{tx_id}"
 
 
 def create_item_logic(price: int):
@@ -182,6 +188,146 @@ def remove_stock_logic(item_id: str, amount: int):
         except redis.exceptions.RedisError:
             return response_error(DB_ERROR_STR)
     return response_error("Conflict: could not subtract stock after retries")
+
+def add_stock_batch_logic(items_json: str, transaction_id: str | None = None):
+    """
+    Atomically add stock for multiple items.
+    payload: {'items': '{"item_id": amount, ...}'}
+    """
+    try:
+        items: dict[str, int] = json.loads(items_json)
+    except json.JSONDecodeError:
+        return response_error("Invalid JSON format for items")
+
+    keys = list(items.keys())
+    tx_key = _stock_tx_key(transaction_id) if transaction_id else None
+    
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                if tx_key:
+                    pipe.watch(tx_key, *keys)
+                    state = pipe.get(tx_key)
+                    
+                    if state == TX_DEDUCTED:
+                        # Proceed to add stock (actual rollback)
+                        pass 
+                    elif state == TX_ROLLED_BACK:
+                        pipe.unwatch()
+                        return response_success("Rollback already processed (idempotent)")
+                    else:
+                        # Key does not exist (or unknown state). 
+                        # Set Tombstone to prevent future deductions.
+                        pipe.multi()
+                        pipe.set(tx_key, TX_ROLLED_BACK)
+                        pipe.execute()
+                        return response_success("Rollback tombstone set (deduction never happened)")
+                else:
+                    pipe.watch(*keys)
+                
+                current_values = {}
+                missing_item = None
+                
+                for key in keys:
+                    raw = pipe.get(key)
+                    if raw is None:
+                        missing_item = key
+                        break
+                    current_values[key] = msgpack.decode(raw, type=StockValue)
+                
+                if missing_item:
+                    pipe.unwatch()
+                    return response_error(f"Item: {missing_item} not found!")
+
+                pipe.multi()
+                for key, amount in items.items():
+                    entry = current_values[key]
+                    entry.stock += int(amount)
+                    pipe.set(key, msgpack.encode(entry))
+                if tx_key:
+                    pipe.set(tx_key, TX_ROLLED_BACK)
+                pipe.execute()
+                return response_success(f"Batch stock added for {len(items)} items")
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return response_error(DB_ERROR_STR)
+    return response_error("Conflict: could not update stock batch after retries")
+
+def subtract_stock_batch_logic(items_json: str, transaction_id: str | None = None):
+    """
+    Atomically subtract stock for multiple items.
+    """
+    try:
+        items: dict[str, int] = json.loads(items_json)
+    except json.JSONDecodeError:
+        return response_error("Invalid JSON format for items")
+
+    keys = list(items.keys())
+    reserved_keys = [_stock_reserved_key(k) for k in keys]
+    all_watch_keys = keys + reserved_keys
+    tx_key = _stock_tx_key(transaction_id) if transaction_id else None
+
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                if tx_key:
+                    pipe.watch(tx_key, *all_watch_keys)
+                    state = pipe.get(tx_key)
+                    
+                    if state == TX_DEDUCTED:
+                        pipe.unwatch()
+                        return response_success("Stock already deducted (idempotent)")
+                    if state == TX_ROLLED_BACK:
+                        pipe.unwatch()
+                        return response_success("Ignored deduction (rolled back via tombstone)")
+                else:
+                    pipe.watch(*all_watch_keys)
+                
+                current_values = {}
+                current_reserved = {}
+                missing_item = None
+                insufficient_item = None
+                
+                for key in keys:
+                    raw = pipe.get(key)
+                    if raw is None:
+                        missing_item = key
+                        break
+                    current_values[key] = msgpack.decode(raw, type=StockValue)
+                    
+                    r_key = _stock_reserved_key(key)
+                    res_val = pipe.get(r_key)
+                    current_reserved[key] = int(res_val or 0)
+                
+                if missing_item:
+                    pipe.unwatch()
+                    return response_error(f"Item: {missing_item} not found!")
+
+                for key, amount in items.items():
+                    entry = current_values[key]
+                    if entry.stock - int(amount) < current_reserved[key]:
+                        insufficient_item = key
+                        break
+                
+                if insufficient_item:
+                    pipe.unwatch()
+                    return response_error(f"Item: {insufficient_item} insufficient stock/reserved conflict")
+
+                pipe.multi()
+                for key, amount in items.items():
+                    entry = current_values[key]
+                    entry.stock -= int(amount)
+                    pipe.set(key, msgpack.encode(entry))
+                if tx_key:
+                    pipe.set(tx_key, TX_DEDUCTED)
+                pipe.execute()
+                return response_success(f"Batch stock subtracted for {len(items)} items")
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return response_error(DB_ERROR_STR)
+    return response_error("Conflict: could not subtract stock batch after retries")
 
 
 # ─── 2PC Participant Endpoints ─────────────────────────────────────────────────
@@ -473,6 +619,12 @@ def run_event_listener():
                             result = add_stock_logic(payload['item_id'], int(payload['amount']))
                         elif msg_type == 'subtract_stock':
                             result = remove_stock_logic(payload['item_id'], int(payload['amount']))
+                        elif msg_type == 'add_stock_batch':
+                            tx_id = payload.get('transaction_id')
+                            result = add_stock_batch_logic(payload['items'], tx_id)
+                        elif msg_type == 'subtract_stock_batch':
+                            tx_id = payload.get('transaction_id')
+                            result = subtract_stock_batch_logic(payload['items'], tx_id)
                         elif msg_type == 'prepare_subtract':
                             result = prepare_subtract_logic(payload['order_id'], payload['item_id'], int(payload['amount']))
                         elif msg_type == 'commit_subtract':
