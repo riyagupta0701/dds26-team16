@@ -2,8 +2,10 @@ import logging
 import os
 import atexit
 import random
+import time
 import uuid
 import json
+import threading
 from collections import defaultdict
 
 import redis
@@ -13,11 +15,6 @@ from flask import Flask, jsonify, abort, Response
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
-
-
-# CHECKOUT_MODE: "saga" (default) or "2pc"
-CHECKOUT_MODE = os.environ.get('CHECKOUT_MODE', 'saga').lower()
-
 app = Flask("order-service")
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
@@ -36,7 +33,6 @@ def close_db_connection():
     db.close()
     mq.close()
 
-
 atexit.register(close_db_connection)
 
 # Order status values — shared by Saga and 2PC
@@ -50,14 +46,12 @@ STATUS_FAILED  = "failed"    # rolled back
 COORD_PENDING_KEY = "2pc:pending"
 SAGA_PENDING_KEY = "saga:pending"
 
-
 class OrderValue(Struct, kw_only=True):
     paid: bool
     items: dict[str, int]
     user_id: str
     total_cost: int
     status: str = STATUS_PENDING
-
 
 # DB helpers
 def get_order_from_db(order_id: str) -> OrderValue | None:
@@ -85,7 +79,6 @@ def create_order(user_id: str):
         app.logger.error("Failed to save order: %s", key)
         return abort(500, DB_ERROR_STR)
     return jsonify({'order_id': key})
-
 
 @app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
 def batch_init_orders(n: int, n_items: int, n_users: int, item_price: int):
@@ -119,7 +112,6 @@ def batch_init_orders(n: int, n_items: int, n_users: int, item_price: int):
         return abort(500, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
 
-
 @app.get('/find/<order_id>')
 def find_order(order_id: str):
     order_entry: OrderValue = get_order_from_db(order_id)
@@ -135,6 +127,19 @@ def find_order(order_id: str):
     )
 
 
+@app.post('/mode/<new_mode>')
+def set_checkout_mode_endpoint(new_mode: str):
+    mode = new_mode.lower()
+    if mode not in ['saga', '2pc']:
+        abort(400, "Invalid mode. Use 'saga' or '2pc'.")
+
+    try:
+        db.set("system:checkout_mode", mode)
+        app.logger.info(f"System checkout mode dynamically set to: {mode}")
+        return Response(f"Mode set to {mode}", status=200)
+    except redis.exceptions.RedisError:
+        abort(500, DB_ERROR_STR)
+
 @app.get('/health')
 def health_check():
     try:
@@ -144,7 +149,6 @@ def health_check():
         app.logger.error(f"Health check failed: {e}")
         return jsonify({"status": "unhealthy", "db": "disconnected"}), 500
 
-# HTTP helpers with retry
 class RpcResponse:
     def __init__(self, status_code, json_data=None, error_msg=None):
         self.status_code = status_code
@@ -154,7 +158,7 @@ class RpcResponse:
     def json(self):
         return self._json
 
-def send_rpc(stream: str, action: str, data: dict, retries: int = 3) -> RpcResponse | None:
+def send_rpc(stream: str, action: str, data: dict, retries: int = 1) -> RpcResponse | None:
     """
     Sends a command to a Redis Stream and waits for a reply on a temporary list.
     Acts as a synchronous RPC wrapper over async streams.
@@ -194,7 +198,6 @@ def send_rpc(stream: str, action: str, data: dict, retries: int = 3) -> RpcRespo
     mq.delete(reply_key)
     return None
 
-
 @app.post('/addItem/<order_id>/<item_id>/<quantity>')
 def add_item(order_id: str, item_id: str, quantity: int):
     # Fetch item price first (outside the Redis transaction — read-only, no lock needed).
@@ -230,7 +233,6 @@ def add_item(order_id: str, item_id: str, quantity: int):
             abort(500, DB_ERROR_STR)
     abort(400, "Conflict: could not add item after retries")
 
-
 def rollback_stock(items: dict[str, int], transaction_id: str | None = None):
     # Best-effort: use _recovery_post so a network hiccup during compensation
     # does not raise an HTTPException that would prevent STATUS_FAILED from
@@ -238,17 +240,23 @@ def rollback_stock(items: dict[str, int], transaction_id: str | None = None):
     payload = {'items': json.dumps(items), 'transaction_id': transaction_id} if transaction_id else {'items': json.dumps(items)}
     _recovery_rpc('events:stock', 'add_stock_batch', payload)
 
-
-# Checkout dispatcher
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    app.logger.debug(f"Checkout {order_id} using mode={CHECKOUT_MODE}")
-    if CHECKOUT_MODE == '2pc':
-        return checkout_2pc(order_id)
-    elif CHECKOUT_MODE == 'saga':
-        return checkout_saga(order_id)
-    else: abort(501, "Select a valid checkout mode.")
+    # Dynamically fetch the mode. Default to saga if not set.
+    try:
+        raw_mode = db.get("system:checkout_mode")
+        current_mode = raw_mode.decode('utf-8') if raw_mode else 'saga'
+    except redis.exceptions.RedisError:
+        abort(500, DB_ERROR_STR)
 
+    app.logger.debug(f"Checkout {order_id} using dynamic mode={current_mode}")
+
+    if current_mode == '2pc':
+        return checkout_2pc(order_id)
+    elif current_mode == 'saga':
+        return checkout_saga(order_id)
+    else:
+        abort(501, "Select a valid checkout mode.")
 
 def checkout_saga(order_id: str):
     """
@@ -273,7 +281,6 @@ def checkout_saga(order_id: str):
                           (order was in-flight when a container died)
     """
     order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
 
     # --- Idempotency guards ---
     if order_entry.status == STATUS_PAID:
@@ -354,7 +361,6 @@ def checkout_saga(order_id: str):
 
     app.logger.debug(f"Checkout {order_id} successful")
     return Response("Checkout successful", status=200)
-
 
 # ─── 2PC Coordinator ──────────────────────────────────────────────────────────
 #
@@ -472,7 +478,6 @@ def checkout_2pc(order_id: str):
     app.logger.debug(f"2PC checkout {order_id} committed successfully")
     return Response("Checkout successful", status=200)
 
-
 def _abort_2pc(
     order_id: str,
     order_entry: OrderValue,
@@ -543,6 +548,13 @@ def recover_2pc():
 
     for order_id_bytes in pending:
         order_id = order_id_bytes.decode()
+
+        # --- ROW-LEVEL LOCK ---
+        lock_key = f"recovery_lock_2pc:{order_id}"
+        # Lock expires in 30s. If a worker dies mid-recovery, another can retry.
+        if not db.set(lock_key, "locked", nx=True, ex=30):
+            continue  # Another worker claimed this order. Skip to the next one.
+
         try:
             raw = db.get(order_id)
             if not raw:
@@ -550,58 +562,46 @@ def recover_2pc():
                 db.srem(COORD_PENDING_KEY, order_id)
                 continue
             order = msgpack.decode(raw, type=OrderValue)
-        except Exception as exc:
-            app.logger.error(f"Recovery: failed to read order {order_id}: {exc}")
-            continue
+            items_quantities = order.items
 
-        items_quantities = order.items
+            if order.status == STATUS_PAID:
+                app.logger.info(f"Recovery: re-driving COMMIT for order {order_id}")
+                all_committed = True
+                if not _recovery_rpc('events:stock', 'commit_subtract_batch',
+                                     {'order_id': order_id, 'items': json.dumps(items_quantities)}):
+                    all_committed = False
+                if not _recovery_rpc('events:payment', 'commit_pay',
+                                     {'order_id': order_id, 'user_id': order.user_id, 'amount': order.total_cost}):
+                    all_committed = False
 
-        if order.status == STATUS_PAID:
-            # Commit decision was durably logged; re-drive COMMITs to all participants.
-            app.logger.info(f"Recovery: re-driving COMMIT for order {order_id}")
-            all_committed = True
-            if not _recovery_rpc('events:stock', 'commit_subtract_batch', {'order_id': order_id, 'items': json.dumps(items_quantities)}):
-                all_committed = False
-            if not _recovery_rpc('events:payment', 'commit_pay', {'order_id': order_id, 'user_id': order.user_id, 'amount': order.total_cost}):
-                all_committed = False
-
-            if all_committed:
-                try:
+                if all_committed:
                     db.srem(COORD_PENDING_KEY, order_id)
-                except redis.exceptions.RedisError:
-                    app.logger.warning(f"Recovery: could not remove {order_id} from WAL")
-            # else: leave in WAL; next recovery pass will retry commits.
+            else:
+                app.logger.info(f"Recovery: re-driving ABORT for order {order_id} (status={order.status})")
+                all_aborted = True
+                if not _recovery_rpc('events:stock', 'abort_subtract_batch',
+                                     {'order_id': order_id, 'items': json.dumps(items_quantities)}):
+                    all_aborted = False
+                if not _recovery_rpc('events:payment', 'abort_pay',
+                                     {'order_id': order_id, 'user_id': order.user_id, 'amount': order.total_cost}):
+                    all_aborted = False
 
-        else:
-            # STATUS_STARTED (or any unexpected state): coordinator crashed
-            # before writing the commit decision.  Abort all participants.
-            # Abort is safe even for participants that never received PREPARE.
-            app.logger.info(f"Recovery: re-driving ABORT for order {order_id} (status={order.status})")
-            all_aborted = True
-            if not _recovery_rpc('events:stock', 'abort_subtract_batch', {'order_id': order_id, 'items': json.dumps(items_quantities)}):
-                all_aborted = False
-            if not _recovery_rpc('events:payment', 'abort_pay', {'order_id': order_id, 'user_id': order.user_id, 'amount': order.total_cost}):
-                all_aborted = False
-
-            if all_aborted:
-                order.status = STATUS_FAILED
-                try:
+                if all_aborted:
+                    order.status = STATUS_FAILED
                     with db.pipeline(transaction=True) as pipe:
                         pipe.set(order_id, msgpack.encode(order))
                         pipe.srem(COORD_PENDING_KEY, order_id)
                         pipe.execute()
-                except redis.exceptions.RedisError:
-                    app.logger.error(f"Recovery: failed to persist FAILED for order {order_id}")
+        except Exception as exc:
+            app.logger.error(f"Recovery: failed to read/process order {order_id}: {exc}")
+        finally:
+            # Release the row-level lock so another worker can try later if this failed
+            db.delete(lock_key)
 
-    app.logger.info("Recovery: complete")
+    app.logger.info("2PC Recovery: complete")
 
 
 def recover_saga():
-    """
-    Scans the Saga WAL for orders stuck in STATUS_STARTED (implies coordinator crash).
-    Using checkpoints, we can determine which compensation logic to run.
-    they are not stuck indefinitely.
-    """
     try:
         pending = db.smembers(SAGA_PENDING_KEY)
     except redis.exceptions.RedisError as exc:
@@ -615,6 +615,12 @@ def recover_saga():
 
     for order_id_bytes in pending:
         order_id = order_id_bytes.decode()
+
+        # --- ROW-LEVEL LOCK ---
+        lock_key = f"recovery_lock_saga:{order_id}"
+        if not db.set(lock_key, "locked", nx=True, ex=30):
+            continue
+
         try:
             raw = db.get(order_id)
             if not raw:
@@ -627,26 +633,20 @@ def recover_saga():
             # The Stock service's tombstone logic handles whether to act or ignore.
             if order.status == STATUS_STARTED:
                 app.logger.warning(f"Saga Recovery: Order {order_id} found in {order.status}. Blindly firing rollback.")
-                # Re-calculate items dict to pass to rollback
                 items_quantities = order.items
 
-                # Fire-and-forget ROLLBACK to Stock Service
-                # We do not use send_rpc because we don't want to wait for a reply.
                 mq.xadd('events:stock', {
                     'type': 'add_stock_batch',
                     'items': json.dumps(items_quantities),
                     'transaction_id': order_id
                 })
-
-                # Fire-and-forget ROLLBACK to Payment Service
-                # Relies on Payment Service Tombstone to handle if charge never happened.
                 mq.xadd('events:payment', {
                     'type': 'add_credit',
                     'user_id': order.user_id,
                     'amount': str(order.total_cost),
                     'transaction_id': order_id
                 })
-                
+
                 order.status = STATUS_FAILED
                 db.set(order_id, msgpack.encode(order))
 
@@ -654,32 +654,35 @@ def recover_saga():
 
         except Exception as e:
             app.logger.error(f"Saga Recovery: error processing {order_id}: {e}")
+        finally:
+            db.delete(lock_key)
+
 
 def _run_recovery():
-    """Run recovery; never raises so a startup failure cannot kill the worker."""
+    """Executes the recovery loops safely inside the background thread."""
+    time.sleep(5)
+    try:
+        recover_2pc()
+        recover_saga()
+    except Exception as exc:
+        app.logger.error(f"Recovery failed at startup: {exc}")
 
-    # Attempt to set a key. NX=True means it only succeeds if the key DOES NOT exist.
-    # EX=30 means the lock automatically deletes itself after 30 seconds to prevent deadlocks.
-    lock_acquired = db.set("order_startup_lock", "locked", nx=True, ex=30)
 
-    if lock_acquired:
-        app.logger.info(f"Worker {os.getpid()} acquired the startup lock. Executing WAL recovery...")
-        try:
-            recover_2pc()
-            recover_saga()
-        except Exception as exc:
-            app.logger.error(f"Recovery failed at startup: {exc}")
-        finally:
-            db.delete("order_startup_lock")
-    else:
-        app.logger.info(f"Worker {os.getpid()} skipping recovery (another worker is handling it).")
+def start_background_recovery():
+    """Spawns recovery in a background thread so Gunicorn can bind to the HTTP port immediately."""
+    app.logger.info(f"Worker {os.getpid()} delegating WAL recovery to background thread.")
+    recovery_thread = threading.Thread(target=_run_recovery, daemon=True)
+    recovery_thread.start()
+
 
 if __name__ == '__main__':
-    _run_recovery()
+    start_background_recovery()
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
     # Configure logging first so recover_2pc() log output goes to gunicorn.
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
-    _run_recovery()
+
+    # Do not block the worker! Run in the background.
+    start_background_recovery()
