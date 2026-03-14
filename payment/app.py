@@ -27,10 +27,10 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
 
 # Separate connection for Message Queue operations
 # Defaults to the same host as DB, but allows splitting in production
-mq: redis.Redis = redis.Redis(host=os.environ.get('MQ_REDIS_HOST', os.environ['REDIS_HOST']),
-                              port=int(os.environ.get('MQ_REDIS_PORT', os.environ['REDIS_PORT'])),
-                              password=os.environ.get('MQ_REDIS_PASSWORD', os.environ['REDIS_PASSWORD']),
-                              db=int(os.environ.get('MQ_REDIS_DB', os.environ['REDIS_DB'])))
+mq: redis.Redis = redis.Redis(host=os.environ['MQ_REDIS_HOST'],
+                              port=int(os.environ['MQ_REDIS_PORT']),
+                              password=os.environ['MQ_REDIS_PASSWORD'],
+                              db=int(os.environ['MQ_REDIS_DB']))
 
 def close_db_connection():
     db.close()
@@ -228,6 +228,7 @@ def prepare_pay_logic(order_id: str, user_id: str, amount: int):
     except redis.exceptions.RedisError:
         return response_error(DB_ERROR_STR)
 
+    app.logger.debug(f"2PC prepare OK  order={order_id} user={user_id} amount={amount}")
     return response_success("Prepare: OK")
 
 def commit_pay_logic(order_id: str, user_id: str, amount: int):
@@ -292,6 +293,7 @@ def commit_pay_logic(order_id: str, user_id: str, amount: int):
     except redis.exceptions.RedisError:
         return response_error(DB_ERROR_STR)
 
+    app.logger.debug(f"2PC commit OK   order={order_id} user={user_id} amount={amount}")
     return response_success("Commit: OK")
 
 def abort_pay_logic(order_id: str, user_id: str, amount: int):
@@ -383,6 +385,17 @@ def abort_pay(order_id: str, user_id: str, amount: int):
     return Response(res['body'], status=200) if res['status_code'] == 200 else abort(res['status_code'], res.get('error'))
 
 
+@app.get('/health')
+def health_check():
+    try:
+        db.ping()
+        mq.ping()
+        return jsonify({"status": "healthy", "db": "connected", "mq": "connected"}), 200
+    except redis.exceptions.RedisError as e:
+        app.logger.error(f"Health check failed: {e}")
+        return jsonify({"status": "unhealthy", "db": "disconnected", "mq": "disconnected"}), 500
+
+
 # ─── Message Queue Listener ───────────────────────────────────────────────────
 
 def run_event_listener():
@@ -408,6 +421,7 @@ def run_event_listener():
 
             for _, messages in streams:
                 for message_id, data in messages:
+                    reply_to = None
                     try:
                         payload = {k.decode('utf-8'): v.decode('utf-8') for k, v in data.items()}
                         msg_type = payload.get('type')
