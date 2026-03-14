@@ -26,9 +26,11 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
       - REDIS_DB=0
+      - REDIS_SENTINEL_HOSTS=order-redis-sentinel:26379
+      - REDIS_MASTER_NAME=order-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
-      order-redis-master:
+      order-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -42,18 +44,18 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
       - REDIS_DB=0
+      - REDIS_SENTINEL_HOSTS=order-redis-sentinel:26379
+      - REDIS_MASTER_NAME=order-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
-      order-redis-master:
+      order-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
   order-redis-master:
     image: redis:7.2-bookworm
-    # --appendonly yes + --appendfsync everysec: AOF persistence, fsync once/sec.
-    # Guarantees at most 1 second of data loss on a hard crash.
-    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb",
-              "--appendonly", "yes", "--appendfsync", "everysec"]
+    command: ["redis-server", "--requirepass", "redis", "--masterauth", "redis",
+              "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - order-master-data:/data
     healthcheck:
@@ -74,6 +76,28 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  order-redis-sentinel:
+    image: redis:7.2-bookworm
+    command: >
+      sh -c "
+        echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+        echo 'sentinel monitor order-master order-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel auth-pass order-master redis' >> /tmp/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds order-master 5000' >> /tmp/sentinel.conf &&
+        echo 'sentinel failover-timeout order-master 10000' >> /tmp/sentinel.conf &&
+        echo 'sentinel parallel-syncs order-master 1' >> /tmp/sentinel.conf &&
+        redis-server /tmp/sentinel.conf --sentinel --port 26379
+      "
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    depends_on:
+      order-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
   # STOCK SERVICE
   stock-service-1:
     build: ./stock
@@ -83,9 +107,11 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
       - REDIS_DB=0
+      - REDIS_SENTINEL_HOSTS=stock-redis-sentinel:26379
+      - REDIS_MASTER_NAME=stock-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
-      stock-redis-master:
+      stock-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -97,16 +123,18 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
       - REDIS_DB=0
+      - REDIS_SENTINEL_HOSTS=stock-redis-sentinel:26379
+      - REDIS_MASTER_NAME=stock-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
-      stock-redis-master:
+      stock-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
   stock-redis-master:
     image: redis:7.2-bookworm
-    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb",
-              "--appendonly", "yes", "--appendfsync", "everysec"]
+    command: ["redis-server", "--requirepass", "redis", "--masterauth", "redis",
+              "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - stock-master-data:/data
     healthcheck:
@@ -127,6 +155,28 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  stock-redis-sentinel:
+    image: redis:7.2-bookworm
+    command: >
+      sh -c "
+        echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+        echo 'sentinel monitor stock-master stock-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel auth-pass stock-master redis' >> /tmp/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds stock-master 5000' >> /tmp/sentinel.conf &&
+        echo 'sentinel failover-timeout stock-master 10000' >> /tmp/sentinel.conf &&
+        echo 'sentinel parallel-syncs stock-master 1' >> /tmp/sentinel.conf &&
+        redis-server /tmp/sentinel.conf --sentinel --port 26379
+      "
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    depends_on:
+      stock-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
   # PAYMENT SERVICE
   payment-service-1:
     build: ./payment
@@ -136,9 +186,11 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
       - REDIS_DB=0
+      - REDIS_SENTINEL_HOSTS=payment-redis-sentinel:26379
+      - REDIS_MASTER_NAME=payment-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
-      payment-redis-master:
+      payment-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -150,16 +202,18 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
       - REDIS_DB=0
+      - REDIS_SENTINEL_HOSTS=payment-redis-sentinel:26379
+      - REDIS_MASTER_NAME=payment-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
-      payment-redis-master:
+      payment-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
   payment-redis-master:
     image: redis:7.2-bookworm
-    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb",
-              "--appendonly", "yes", "--appendfsync", "everysec"]
+    command: ["redis-server", "--requirepass", "redis", "--masterauth", "redis",
+              "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - payment-master-data:/data
     healthcheck:
@@ -175,6 +229,28 @@ services:
               "--masterauth", "redis", "--maxmemory", "512mb", "--appendonly", "yes"]
     volumes:
       - payment-replica-data:/data
+    depends_on:
+      payment-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  payment-redis-sentinel:
+    image: redis:7.2-bookworm
+    command: >
+      sh -c "
+        echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+        echo 'sentinel monitor payment-master payment-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel auth-pass payment-master redis' >> /tmp/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds payment-master 5000' >> /tmp/sentinel.conf &&
+        echo 'sentinel failover-timeout payment-master 10000' >> /tmp/sentinel.conf &&
+        echo 'sentinel parallel-syncs payment-master 1' >> /tmp/sentinel.conf &&
+        redis-server /tmp/sentinel.conf --sentinel --port 26379
+      "
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
     depends_on:
       payment-redis-master:
         condition: service_healthy

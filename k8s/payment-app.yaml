@@ -41,6 +41,17 @@ spec:
       labels:
         component: payment
     spec:
+      initContainers:
+        - name: wait-for-sentinel
+          image: redis:7.2-bookworm
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "Waiting for payment-redis-sentinel..."
+              until redis-cli -h payment-redis-sentinel -p 26379 ping; do
+                sleep 2
+              done
+              echo "Sentinel ready."
       containers:
         - name: payment
           image: payment:latest
@@ -84,3 +95,7 @@ spec:
               value: "redis"
             - name: REDIS_DB
               value: "0"
+            - name: REDIS_SENTINEL_HOSTS
+              value: "payment-redis-sentinel:26379"
+            - name: REDIS_MASTER_NAME
+              value: "payment-master"

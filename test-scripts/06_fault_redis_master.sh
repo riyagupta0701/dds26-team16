@@ -1,33 +1,75 @@
 #!/usr/bin/env bash
-# Test 6: Fault tolerance — kill a Redis master, Sentinel promotes replica
+# Test 6: Fault tolerance — kill a Redis master, Sentinel promotes the replica.
+#
+# Kills the Redis master for each service in turn and verifies that checkouts
+# continue to work through the Sentinel-elected new master. After each test
+# the old master is restarted (it rejoins as a replica).
+#
+# Works in both DEPLOY_MODE=docker and DEPLOY_MODE=kube.
+#   docker: stops/starts the {svc}-redis-master container
+#   kube:   deletes/waits on the {svc}-redis-node-0 pod (bitnami Sentinel StatefulSet)
 source "$(dirname "$0")/helpers.sh"
 
 header "TEST 6 — Fault Tolerance: Redis Master Failure (Sentinel Failover)"
 
-FAILOVER_WAIT=8  # seconds to allow Sentinel to elect new master
-
 seed_data
 
-MASTERS=("order-redis-master" "stock-redis-master" "payment-redis-master")
+SERVICES=("order" "stock" "payment")
 
-for MASTER in "${MASTERS[@]}"; do
-  yellow "Stopping $MASTER..."
-  docker compose stop "$MASTER" > /dev/null 2>&1
+# Wait for Sentinel failover to complete for the affected service.
+# Polls a read-only endpoint until it returns 200 (Redis up) instead of 400 (DB error).
+# All probes are read-only — they use data seeded by seed_data and write nothing:
+#   stock   → GET /stock/find/0    (item 0 created by batch_init)
+#   payment → GET /payment/find/0  (user 0 created by batch_init)
+#   order   → GET /orders/find/0   (order 0 created by batch_init)
+_wait_for_recovery() {
+  local svc="$1"
+  yellow "Polling until $svc Redis recovers from Sentinel failover..."
+  local consecutive=0
+  for i in $(seq 1 40); do
+    case "$svc" in
+      stock)   _c=$(get_code "/stock/find/0") ;;
+      payment) _c=$(get_code "/payment/find_user/0") ;;
+      order)   _c=$(get_code "/orders/find/0") ;;
+    esac
+    if [ "$_c" = "200" ]; then
+      consecutive=$((consecutive+1))
+      # Require 4 consecutive 200s: with 2 replicas and round-robin, this
+      # guarantees every replica has a working Redis connection.
+      if [ "$consecutive" -ge 4 ]; then
+        green "$svc service recovered after Sentinel failover"
+        return 0
+      fi
+    else
+      consecutive=0
+    fi
+    sleep 1
+  done
+  red "$svc Redis did not recover within 40s"
+  FAIL=$((FAIL+1))
+  return 1
+}
 
-  yellow "Waiting ${FAILOVER_WAIT}s for Sentinel failover..."
-  sleep "$FAILOVER_WAIT"
+for SVC in "${SERVICES[@]}"; do
+  header "Failing $SVC Redis master"
 
-  USER_ID=$(create_funded_user 200)
-  ORDER_ID=$(create_order_with_item "$USER_ID" 0 1)
-  CODE=$(post "/orders/checkout/$ORDER_ID")
-  assert_http "Checkout works after $MASTER failover" "200" "$CODE"
+  redis_kill_master "$SVC"
 
-  ORDER_STATUS=$(json_field "$(get_body /orders/find/$ORDER_ID)" "status")
-  assert_eq "Order correctly marked paid after failover" "paid" "$ORDER_STATUS"
+  if _wait_for_recovery "$SVC"; then
+    USER_ID=$(create_funded_user 200)
+    ORDER_ID=$(create_order_with_item "$USER_ID" 0 1)
+    CODE=$(post "/orders/checkout/$ORDER_ID")
+    assert_http "Checkout works after $SVC Redis master failover" "200" "$CODE"
 
-  yellow "Restarting $MASTER (will rejoin as replica)..."
-  docker compose start "$MASTER" > /dev/null 2>&1
-  sleep 5  # allow resync before next test
+    ORDER_STATUS=$(json_field "$(get_body /orders/find/$ORDER_ID)" "status")
+    assert_eq "Order correctly marked paid after $SVC failover" "paid" "$ORDER_STATUS"
+  fi
+
+  # Always wait for master pod to rejoin before the next iteration,
+  # even if the checkout test was skipped — avoids cascading failures.
+  redis_restart_master "$SVC"
+  yellow "Waiting 5s for $SVC replica resync..."
+  sleep 5
 done
 
 summary

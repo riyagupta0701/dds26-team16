@@ -39,6 +39,17 @@ spec:
       labels:
         component: stock
     spec:
+      initContainers:
+        - name: wait-for-sentinel
+          image: redis:7.2-bookworm
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "Waiting for stock-redis-sentinel..."
+              until redis-cli -h stock-redis-sentinel -p 26379 ping; do
+                sleep 2
+              done
+              echo "Sentinel ready."
       containers:
         - name: stock
           image: stock:latest
@@ -76,3 +87,7 @@ spec:
               value: "redis"
             - name: REDIS_DB
               value: "0"
+            - name: REDIS_SENTINEL_HOSTS
+              value: "stock-redis-sentinel:26379"
+            - name: REDIS_MASTER_NAME
+              value: "stock-master"

@@ -109,17 +109,12 @@ create_order_with_item() {
 # Runtime helpers — work in both DEPLOY_MODE=docker and DEPLOY_MODE=kube
 # ---------------------------------------------------------------------------
 
-# Maps a docker-compose service name to a Kubernetes resource:
-#   app services  → component label (used by Deployments)
-#   redis masters → StatefulSet pod name (one StatefulSet per Helm release)
+# Maps an app component name to a Kubernetes label selector or pod name.
 _kube_resource() {
   case "$1" in
-    *order-redis*)   echo "pod/order-redis-master-0"   ;;
-    *stock-redis*)   echo "pod/stock-redis-master-0"   ;;
-    *payment-redis*) echo "pod/payment-redis-master-0" ;;
-    *order*)         echo "label:component=order"      ;;
-    *stock*)         echo "label:component=stock"      ;;
-    *payment*)       echo "label:component=payment"    ;;
+    *order*)         echo "label:component=order"       ;;
+    *stock*)         echo "label:component=stock"       ;;
+    *payment*)       echo "label:component=payment"     ;;
   esac
 }
 
@@ -166,27 +161,56 @@ service_start() {
 
 # Crash ALL Redis masters (simulates a full data-store outage / power loss).
 # docker: stops all three per-service masters
-# kube:   deletes the master-0 pod of each bitnami StatefulSet (each is recreated automatically)
+# kube:   scales master Deployments to 0 (mirrors docker compose stop)
 redis_crash() {
   yellow "Crashing Redis masters..."
   if [ "$DEPLOY_MODE" = "kube" ]; then
-    kubectl delete pod/order-redis-master-0 pod/stock-redis-master-0 pod/payment-redis-master-0 \
-      --grace-period=0 --wait=false > /dev/null 2>&1
+    kubectl scale deployment/order-redis-master deployment/stock-redis-master deployment/payment-redis-master \
+      --replicas=0 > /dev/null 2>&1
   else
     docker compose stop order-redis-master stock-redis-master payment-redis-master > /dev/null 2>&1
   fi
 }
 
 # Restart ALL Redis masters and wait until they are ready (AOF replay complete).
-# docker: starts all three masters
-# kube:   waits for all three StatefulSet pods to become Ready again
+# docker: starts all three masters (they rejoin as replicas after Sentinel failover)
+# kube:   scales master Deployments back to 1 and waits for Ready
 redis_restore() {
   yellow "Restarting Redis masters (AOF replay on startup)..."
   if [ "$DEPLOY_MODE" = "kube" ]; then
-    kubectl wait pod/order-redis-master-0 pod/stock-redis-master-0 pod/payment-redis-master-0 \
-      --for=condition=Ready --timeout=60s > /dev/null 2>&1
+    kubectl scale deployment/order-redis-master deployment/stock-redis-master deployment/payment-redis-master \
+      --replicas=1 > /dev/null 2>&1
+    kubectl rollout status deployment/order-redis-master deployment/stock-redis-master deployment/payment-redis-master \
+      --timeout=60s > /dev/null 2>&1
   else
     docker compose start order-redis-master stock-redis-master payment-redis-master > /dev/null 2>&1
+  fi
+}
+
+# Kill the Redis master for ONE service (Sentinel will promote the replica).
+# docker: stops {svc}-redis-master container
+# kube:   scales {svc}-redis-master Deployment to 0 (mirrors docker compose stop)
+redis_kill_master() {
+  local svc="$1"   # "order", "stock", or "payment"
+  yellow "Killing $svc Redis master..."
+  if [ "$DEPLOY_MODE" = "kube" ]; then
+    kubectl scale deployment/${svc}-redis-master --replicas=0 > /dev/null 2>&1
+  else
+    docker compose stop ${svc}-redis-master > /dev/null 2>&1
+  fi
+}
+
+# Bring the Redis master back (rejoins as replica after Sentinel failover).
+# docker: starts {svc}-redis-master (Sentinel has already promoted the replica)
+# kube:   scales {svc}-redis-master back to 1 and waits for Ready
+redis_restart_master() {
+  local svc="$1"   # "order", "stock", or "payment"
+  yellow "Waiting for $svc Redis master pod to rejoin as replica..."
+  if [ "$DEPLOY_MODE" = "kube" ]; then
+    kubectl scale deployment/${svc}-redis-master --replicas=1 > /dev/null 2>&1
+    kubectl rollout status deployment/${svc}-redis-master --timeout=60s > /dev/null 2>&1
+  else
+    docker compose start ${svc}-redis-master > /dev/null 2>&1
   fi
 }
 
