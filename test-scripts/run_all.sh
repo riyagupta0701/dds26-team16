@@ -71,7 +71,7 @@ run_test "$SCRIPT_DIR/04_compensation_stock_fails.sh"
 run_test "$SCRIPT_DIR/08_consistency_check.sh"
 
 # 2PC participant protocol (no container restart required)
-run_test "$SCRIPT_DIR/09_2pc_protocol.sh"
+run_test "$SCRIPT_DIR/11_native_mq_2pc.sh"
 
 # Fault tolerance tests (stop/start containers — slower)
 if [ "${SKIP_FAULT_TESTS:-0}" != "1" ]; then

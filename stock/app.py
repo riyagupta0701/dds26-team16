@@ -294,6 +294,7 @@ def subtract_stock_batch_logic(items_json: str, transaction_id: str | None = Non
                     current_reserved[key] = int(res_val or 0)
 
                     entry = current_values[key]
+                    amount = items.get(key)
                     if entry.stock - int(amount) < current_reserved[key]:
                         pipe.unwatch()
                         return response_error(f"Item: {key} insufficient stock/reserved conflict")
@@ -327,7 +328,6 @@ def subtract_stock_batch_logic(items_json: str, transaction_id: str | None = Non
 
 def _stock_wal_key(order_id: str) -> str:
     return f"2pc:stock:{order_id}"
-
 
 def _stock_reserved_key(item_id: str) -> str:
     return f"reserved:stock:{item_id}"
