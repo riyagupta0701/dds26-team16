@@ -43,6 +43,17 @@ spec:
       labels:
         component: order
     spec:
+      initContainers:
+        - name: wait-for-sentinel
+          image: redis:7.2-bookworm
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "Waiting for order-redis-sentinel..."
+              until redis-cli -h order-redis-sentinel -p 26379 ping; do
+                sleep 2
+              done
+              echo "Sentinel ready."
       containers:
         - name: order
           image: order:latest

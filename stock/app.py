@@ -32,11 +32,15 @@ if _SENTINEL_HOSTS:
         _peers,
         password=_REDIS_PASSWORD,
         db=_REDIS_DB,
+        socket_timeout=1.5,
+        socket_connect_timeout=1.5,
     ).master_for(
         _REDIS_MASTER_NAME,
         socket_timeout=1.5,
+        socket_connect_timeout=1.5,
         retry=Retry(NoBackoff(), 3),
-        retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
+        retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
+                        redis.exceptions.ReadOnlyError],
     )
 else:
     db: redis.Redis = redis.Redis(

@@ -25,19 +25,27 @@ SERVICES=("order" "stock" "payment")
 _wait_for_recovery() {
   local svc="$1"
   yellow "Polling until $svc Redis recovers from Sentinel failover..."
-  for i in $(seq 1 30); do
+  local consecutive=0
+  for i in $(seq 1 40); do
     case "$svc" in
       stock)   _c=$(get_code "/stock/find/0") ;;
       payment) _c=$(get_code "/payment/find_user/0") ;;
       order)   _c=$(get_code "/orders/find/0") ;;
     esac
     if [ "$_c" = "200" ]; then
-      green "$svc service recovered after Sentinel failover"
-      return 0
+      consecutive=$((consecutive+1))
+      # Require 4 consecutive 200s: with 2 replicas and round-robin, this
+      # guarantees every replica has a working Redis connection.
+      if [ "$consecutive" -ge 4 ]; then
+        green "$svc service recovered after Sentinel failover"
+        return 0
+      fi
+    else
+      consecutive=0
     fi
     sleep 1
   done
-  red "$svc Redis did not recover within 30s"
+  red "$svc Redis did not recover within 40s"
   FAIL=$((FAIL+1))
   return 1
 }
