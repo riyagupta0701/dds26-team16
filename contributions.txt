@@ -1,1 +1,42 @@
+Contributions
 
+
+Atharva Dagaonkar
+Role: 2PC Lead
+
+- Authored task-split.md and project design documents
+- Implemented 2PC coordinator in order/app.py: checkout_2pc(), _abort_2pc(), recover_2pc()
+- Designed coordinator WAL (COORD_PENDING_KEY) and atomic STATUS_PENDING→STARTED claim via WATCH/MULTI/EXEC
+- Implemented all 2PC participant endpoints (prepare/commit/abort) for both stock and payment services
+- Designed soft-reservation scheme (reserved:stock:{item_id}, reserved:payment:{user_id}) and per-transaction WALs
+- All participant endpoints idempotent via optimistic locking
+- Added concurrent worker guard preventing two gunicorn workers from double-claiming the same order
+- Fixed soft-reservation guards to reject deductions below reserved amounts
+- Wrote 2PC test scripts: mode-switching (07_mode_flag.sh) and end-to-end protocol tests (09_2pc_protocol.sh)
+
+
+Pranav Gupta
+Role: Architecture & Fault Tolerance
+
+- Implemented overall system fault tolerance on the software side.
+- Redesigned the microservices architecture from REST HTTPS-based communication to an "asynchronous" Message Queue (Redis Streams) model.
+- Decoupled State and Messaging layers by implementing independent MQ connection pools with dedicated environment variables.
+- Developed enhanced `/health` endpoints for all microservices to verify both Database and MQ readiness.
+- Implemented synchronous and transactional Saga/2PC recovery logic to ensure consistent state after service crashes.
+
+
+Riya Gupta
+Role: Saga Protocol, Docker Infrastructure
+
+- Implemented the Saga orchestration protocol
+- Upgraded Docker Compose from single-node Redis to a master/replica setup per service and updated `gateway_nginx.conf` for zero-downtime failover with `max_fails`, `proxy_next_upstream`, and keepalive tuning
+- Wrote test scripts (1-5, 7-8, run_all.sh, helpers.sh) covering happy path, idempotency, Saga compensation, app replica fault tolerance, mode switching, and concurrent consistency checks
+- Ran the benchmark against the Docker deployment
+
+
+Jimmy Oei
+Role: Architect
+
+- Designed and Implemented the Kubernetes deployment architecture
+- Wrote test scripts 6, 11-14, and the kubernetes parts of each test
+- Wrote and fixed test scripts: 06_fault_redis_master.sh (Sentinel failover), 10_redis_aof_persistence.sh (AOF persistence)
