@@ -19,7 +19,13 @@ Role:
 
 
 Pranav Gupta
-Role:
+Role: Architecture & Fault Tolerance
+
+- Implemented overall system fault tolerance on the siftware side.
+- Redesigned the microservices architecture from REST HTTPS-based communication to an "asynchronous" Message Queue (Redis Streams) model.
+- Decoupled State and Messaging layers by implementing independent MQ connection pools with dedicated environment variables.
+- Developed enhanced `/health` endpoints for all microservices to verify both Database and MQ readiness.
+- Implemented synchronous and transactional Saga/2PC recovery logic to ensure consistent state after service crashes.
 
 
 Jimmy Oei
