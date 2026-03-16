@@ -106,6 +106,53 @@ create_order_with_item() {
 }
 
 # ---------------------------------------------------------------------------
+# Message Queue helpers
+# ---------------------------------------------------------------------------
+
+# Send an RPC call over Redis Streams and wait for a reply on a temporary list.
+# Usage: mq_rpc <stream> <type> <payload_json_escaped>
+# Returns: The raw JSON response from the service.
+mq_rpc() {
+  local stream="$1"
+  local type="$2"
+  local payload="$3"
+  local req_id=$(head /dev/urandom | LC_ALL=C tr -dc 'a-zA-Z0-9' | head -c 16)
+  local reply_key="reply:test:$req_id"
+
+  docker exec -e REDISCLI_AUTH=redis dds26-team16-mq-redis-1 redis-cli \
+    XADD "$stream" "*" \
+    type "$type" \
+    reply_to "$reply_key" \
+    payload "$payload" > /dev/null
+
+  local resp=$(docker exec -e REDISCLI_AUTH=redis dds26-team16-mq-redis-1 redis-cli BLPOP "$reply_key" 5)
+  echo "$resp" | tail -n 1 | tr -d '\r'
+}
+
+# Special version for 2PC which often passes order_id/items as top-level fields
+mq_rpc_2pc() {
+  local stream="$1"
+  local type="$2"
+  local order_id="$3"
+  local items_json="$4"
+  local user_id="$5"
+  local amount="$6"
+  
+  local req_id=$(head /dev/urandom | LC_ALL=C tr -dc 'a-zA-Z0-9' | head -c 16)
+  local reply_key="reply:test:$req_id"
+
+  local cmd=("XADD" "$stream" "*" "type" "$type" "reply_to" "$reply_key")
+  [ -n "$order_id" ] && cmd+=("order_id" "$order_id")
+  [ -n "$items_json" ] && cmd+=("items" "$items_json")
+  [ -n "$user_id" ] && cmd+=("user_id" "$user_id")
+  [ -n "$amount" ] && cmd+=("amount" "$amount")
+
+  docker exec -e REDISCLI_AUTH=redis dds26-team16-mq-redis-1 redis-cli "${cmd[@]}" > /dev/null
+  local resp=$(docker exec -e REDISCLI_AUTH=redis dds26-team16-mq-redis-1 redis-cli BLPOP "$reply_key" 5)
+  echo "$resp" | tail -n 1 | tr -d '\r'
+}
+
+# ---------------------------------------------------------------------------
 # Runtime helpers — work in both DEPLOY_MODE=docker and DEPLOY_MODE=kube
 # ---------------------------------------------------------------------------
 
@@ -218,26 +265,6 @@ redis_restart_master() {
 # docker: rewrites the service via a compose override file
 # kube:   kubectl set env + waits for rolling update to complete
 set_checkout_mode() {
-  local mode="$1"
-  if [ "$DEPLOY_MODE" = "kube" ]; then
-    kubectl set env deployment/order-deployment CHECKOUT_MODE="$mode" > /dev/null 2>&1
-    kubectl rollout status deployment/order-deployment --timeout=60s > /dev/null 2>&1
-    sleep 4  # allow gunicorn workers to warm up Redis connections and run 2PC recovery
-  else
-    local override="/tmp/checkout_mode_override_$$.yml"
-    cat > "$override" <<YAML
-services:
-  order-service-1:
-    environment:
-      CHECKOUT_MODE: "${mode}"
-  order-service-2:
-    environment:
-      CHECKOUT_MODE: "${mode}"
-YAML
-    docker compose stop order-service-1 order-service-2 > /dev/null 2>&1
-    docker compose -f docker-compose.yml -f "$override" \
-      up -d --no-deps order-service-1 order-service-2 > /dev/null 2>&1
-    rm -f "$override"
-    sleep 4  # let gunicorn workers start and run 2PC recovery
-  fi
+    local mode=$1
+    curl -s -X POST "$BASE_URL/orders/mode/$mode" > /dev/null
 }
