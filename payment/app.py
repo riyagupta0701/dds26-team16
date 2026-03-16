@@ -18,6 +18,9 @@ WAL_PREPARED  = b"prepared"
 WAL_COMMITTED = b"committed"
 WAL_ABORTED   = b"aborted"
 
+TX_CHARGED = b"CHARGED"
+TX_REFUNDED = b"REFUNDED"
+
 app = Flask("payment-service")
 
 _REDIS_PASSWORD    = os.environ.get('REDIS_PASSWORD', '')
@@ -82,10 +85,13 @@ def response_error(error_msg, status_code=400):
 
 def get_user_from_db(user_id: str) -> UserValue | None:
     # get serialized data; let RedisError propagate
-    entry: bytes = db.get(user_id)
+    raw_entry: bytes = db.get(user_id)
     # deserialize data if it exists else return null
-    entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
+    entry: UserValue | None = msgpack.decode(raw_entry, type=UserValue) if raw_entry else None
     return entry
+
+def _payment_tx_key(tx_id: str) -> str:
+    return f"payment:tx:{tx_id}"
 
 # ─── Business Logic (Decoupled) ───────────────────────────────────────────────
 
@@ -95,7 +101,7 @@ def create_user_logic():
     try:
         db.set(key, value)
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
     return response_success({'user_id': key})
 
 def batch_init_logic(n: int, starting_money: int):
@@ -106,14 +112,14 @@ def batch_init_logic(n: int, starting_money: int):
     try:
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
     return response_success({"msg": "Batch init for users successful"})
 
 def find_user_logic(user_id: str):
     try:
         user_entry: UserValue = get_user_from_db(user_id)
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
     if user_entry is None:
         return response_error(f"User: {user_id} not found!", 400)
     return response_success({
@@ -121,16 +127,38 @@ def find_user_logic(user_id: str):
         "credit": user_entry.credit
     })
 
-def add_credit_logic(user_id: str, amount: int):
+def add_credit_logic(user_id: str, amount: int, transaction_id: str | None = None):
     """
     Idempotency: uses a Redis WATCH/MULTI/EXEC optimistic lock so concurrent
     retries from the benchmark cannot double-add funds.
+    If transaction_id is provided (Refund/Rollback), implements Tombstone pattern.
     """
     amount = int(amount)
+    tx_key = _payment_tx_key(transaction_id) if transaction_id else None
+
     for _ in range(10):  # retry loop for optimistic lock
         try:
             with db.pipeline() as pipe:
-                pipe.watch(user_id)
+                if tx_key:
+                    pipe.watch(user_id, tx_key)
+                    state = pipe.get(tx_key)
+                    
+                    if state == TX_CHARGED:
+                        # Valid refund: Proceed to add funds back
+                        pass
+                    elif state == TX_REFUNDED:
+                        pipe.unwatch()
+                        return response_success("Refund already processed (idempotent)")
+                    else:
+                        # Tombstone: Original charge never happened or is delayed.
+                        # Mark as REFUNDED to prevent future charges.
+                        pipe.multi()
+                        pipe.set(tx_key, TX_REFUNDED)
+                        pipe.execute()
+                        return response_success("Refund tombstone set (charge never happened)")
+                else:
+                    pipe.watch(user_id)
+
                 raw = pipe.get(user_id)
                 if raw is None:
                     pipe.reset()
@@ -139,27 +167,45 @@ def add_credit_logic(user_id: str, amount: int):
                 pipe.multi()
                 user_entry.credit += amount
                 pipe.set(user_id, msgpack.encode(user_entry))
+                if tx_key:
+                    pipe.set(tx_key, TX_REFUNDED)
                 pipe.execute()
                 return response_success(f"User: {user_id} credit updated to: {user_entry.credit}")
         except redis.WatchError:
             continue
         except redis.exceptions.RedisError:
-            return response_error(DB_ERROR_STR)
+            return response_error(DB_ERROR_STR, 500)
     return response_error("Conflict: could not update credit after retries")
 
-def remove_credit_logic(user_id: str, amount: int):
+def remove_credit_logic(user_id: str, amount: int, transaction_id: str | None = None):
     """
     Atomically deduct credit using optimistic locking.
     Respects 2PC soft-reservations: only unreserved credit may be deducted.
     Returns 400 if credit would fall below the currently reserved amount.
+    If transaction_id is provided (Charge), implements Tombstone pattern.
     """
     amount = int(amount)
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
     reserved_key = _payment_reserved_key(user_id)
+    tx_key = _payment_tx_key(transaction_id) if transaction_id else None
+
     for _ in range(10):
         try:
             with db.pipeline() as pipe:
-                pipe.watch(user_id, reserved_key)
+                watch_keys = [user_id, reserved_key]
+                if tx_key:
+                    watch_keys.append(tx_key)
+                pipe.watch(*watch_keys)
+
+                if tx_key:
+                    state = pipe.get(tx_key)
+                    if state == TX_REFUNDED:
+                        pipe.unwatch()
+                        return response_success("Ignored charge (rolled back via tombstone)")
+                    if state == TX_CHARGED:
+                        pipe.unwatch()
+                        return response_success("Already charged (idempotent)")
+
                 raw = pipe.get(user_id)
                 if raw is None:
                     pipe.unwatch()
@@ -173,12 +219,14 @@ def remove_credit_logic(user_id: str, amount: int):
                 pipe.multi()
                 user_entry.credit -= amount
                 pipe.set(user_id, msgpack.encode(user_entry))
+                if tx_key:
+                    pipe.set(tx_key, TX_CHARGED)
                 pipe.execute()
                 return response_success(f"User: {user_id} credit updated to: {user_entry.credit}")
         except redis.WatchError:
             continue
         except redis.exceptions.RedisError:
-            return response_error(DB_ERROR_STR)
+            return response_error(DB_ERROR_STR, 500)
     return response_error("Conflict: could not deduct credit after retries")
 
 
@@ -253,7 +301,7 @@ def prepare_pay_logic(order_id: str, user_id: str, amount: int):
                     continue  # concurrent writer; retry
 
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
 
     app.logger.debug(f"2PC prepare OK  order={order_id} user={user_id} amount={amount}")
     return response_success("Prepare: OK")
@@ -318,7 +366,7 @@ def commit_pay_logic(order_id: str, user_id: str, amount: int):
                     continue
 
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
 
     app.logger.debug(f"2PC commit OK   order={order_id} user={user_id} amount={amount}")
     return response_success("Commit: OK")
@@ -364,7 +412,7 @@ def abort_pay_logic(order_id: str, user_id: str, amount: int):
                     continue
 
     except redis.exceptions.RedisError:
-        return response_error(DB_ERROR_STR)
+        return response_error(DB_ERROR_STR, 500)
 
     return response_success("Abort: OK")
 
@@ -428,7 +476,7 @@ def health_check():
 def run_event_listener():
     stream_key = 'events:payment'
     group_name = 'payment_group'
-    consumer_name = f"payment_consumer_{uuid.uuid4()}"
+    consumer_name = f"payment_consumer_{os.environ.get('HOSTNAME', 'local')}"
 
     try:
         mq.xgroup_create(stream_key, group_name, mkstream=True)
@@ -441,7 +489,7 @@ def run_event_listener():
 
     while True:
         try:
-            streams = mq.xreadgroup(group_name, consumer_name, {stream_key: '>'}, count=1, block=5000)
+            streams = mq.xreadgroup(group_name, consumer_name, {stream_key: '>'}, count=1, block=5000, noack=True)
             
             if not streams:
                 continue
@@ -463,9 +511,11 @@ def run_event_listener():
                         elif msg_type == 'find_user':
                             result = find_user_logic(payload['user_id'])
                         elif msg_type == 'add_credit':
-                            result = add_credit_logic(payload['user_id'], int(payload['amount']))
+                            tx_id = payload.get('transaction_id')
+                            result = add_credit_logic(payload['user_id'], int(payload['amount']), tx_id)
                         elif msg_type == 'pay': # Mapped to remove_credit logic
-                            result = remove_credit_logic(payload['user_id'], int(payload['amount']))
+                            tx_id = payload.get('transaction_id')
+                            result = remove_credit_logic(payload['user_id'], int(payload['amount']), tx_id)
                         elif msg_type == 'prepare_pay':
                             result = prepare_pay_logic(payload['order_id'], payload['user_id'], int(payload['amount']))
                         elif msg_type == 'commit_pay':
@@ -477,15 +527,12 @@ def run_event_listener():
                             mq.rpush(reply_to, json.dumps(result))
                             mq.expire(reply_to, 60)
 
-                        mq.xack(stream_key, group_name, message_id)
-
                     except Exception as e:
                         app.logger.error(f"Error processing MQ message {message_id}: {e}")
                         if reply_to:
                              error_res = response_error(f"Internal processing error: {str(e)}", 500)
                              mq.rpush(reply_to, json.dumps(error_res))
                              mq.expire(reply_to, 60)
-                        mq.xack(stream_key, group_name, message_id)
 
         except Exception as e:
             app.logger.error(f"MQ Listener loop error: {e}")

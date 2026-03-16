@@ -1,4 +1,14 @@
 services:
+  # MESSAGE QUEUE BROKER (Transient)
+  mq-redis:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
 
   gateway:
     image: nginx:1.25-bookworm
@@ -20,6 +30,10 @@ services:
     build: ./order
     image: order:latest
     environment:
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
       - GATEWAY_URL=http://gateway:80
       - CHECKOUT_MODE=saga
       - REDIS_HOST=order-redis-master
@@ -30,6 +44,8 @@ services:
       - REDIS_MASTER_NAME=order-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
+      mq-redis:
+        condition: service_healthy
       order-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
@@ -38,6 +54,10 @@ services:
     build: ./order
     image: order:latest
     environment:
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
       - GATEWAY_URL=http://gateway:80
       - CHECKOUT_MODE=saga
       - REDIS_HOST=order-redis-master
@@ -48,6 +68,8 @@ services:
       - REDIS_MASTER_NAME=order-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
+      mq-redis:
+        condition: service_healthy
       order-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
@@ -103,6 +125,10 @@ services:
     build: ./stock
     image: stock:latest
     environment:
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
       - REDIS_HOST=stock-redis-master
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
@@ -111,6 +137,8 @@ services:
       - REDIS_MASTER_NAME=stock-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
+      mq-redis:
+        condition: service_healthy
       stock-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
@@ -119,6 +147,10 @@ services:
     build: ./stock
     image: stock:latest
     environment:
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
       - REDIS_HOST=stock-redis-master
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
@@ -127,6 +159,8 @@ services:
       - REDIS_MASTER_NAME=stock-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
+      mq-redis:
+        condition: service_healthy
       stock-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
@@ -182,6 +216,10 @@ services:
     build: ./payment
     image: user:latest
     environment:
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
       - REDIS_HOST=payment-redis-master
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
@@ -190,6 +228,8 @@ services:
       - REDIS_MASTER_NAME=payment-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
+      mq-redis:
+        condition: service_healthy
       payment-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
@@ -198,6 +238,10 @@ services:
     build: ./payment
     image: user:latest
     environment:
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
       - REDIS_HOST=payment-redis-master
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
@@ -206,6 +250,8 @@ services:
       - REDIS_MASTER_NAME=payment-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
+      mq-redis:
+        condition: service_healthy
       payment-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
