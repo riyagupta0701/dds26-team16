@@ -660,25 +660,33 @@ def recover_saga():
             # We trigger a blind rollback.
             # The Stock service's tombstone logic handles whether to act or ignore.
             if order.status == STATUS_STARTED:
-                app.logger.warning(f"Saga Recovery: Order {order_id} found in {order.status}. Blindly firing rollback.")
+                app.logger.warning(f"Saga Recovery: Order {order_id} found in {order.status}. Synchronously firing rollback.")
                 items_quantities = order.items
-
-                mq.xadd('events:stock', {
-                    'type': 'add_stock_batch',
-                    'items': json.dumps(items_quantities),
+                
+                all_aborted = True
+                
+                if not _recovery_rpc('events:stock', 'add_stock_batch', {
+                    'items': json.dumps(items_quantities), 
                     'transaction_id': order_id
-                })
-                mq.xadd('events:payment', {
-                    'type': 'add_credit',
-                    'user_id': order.user_id,
-                    'amount': str(order.total_cost),
+                }):
+                    all_aborted = False
+                    
+                if not _recovery_rpc('events:payment', 'add_credit', {
+                    'user_id': order.user_id, 
+                    'amount': order.total_cost, 
                     'transaction_id': order_id
-                })
+                }):
+                    all_aborted = False
 
-                order.status = STATUS_FAILED
-                db.set(order_id, msgpack.encode(order))
-
-            db.srem(SAGA_PENDING_KEY, order_id)
+                if all_aborted:
+                    order.status = STATUS_FAILED
+                    with db.pipeline(transaction=True) as pipe:
+                        pipe.set(order_id, msgpack.encode(order))
+                        pipe.srem(SAGA_PENDING_KEY, order_id)
+                        pipe.execute()
+            else:
+                # If it's already PAID or FAILED, we just clean up the WAL
+                db.srem(SAGA_PENDING_KEY, order_id)
 
         except Exception as e:
             app.logger.error(f"Saga Recovery: error processing {order_id}: {e}")

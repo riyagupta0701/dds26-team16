@@ -424,18 +424,20 @@ def commit_subtract_batch_logic(order_id: str, items_json: str):
                     return response_success("Commit batch: already done")
 
                 current_reserved = {}
+                current_values = {}
 
                 for k, amount in items.items():
                     raw = pipe.get(k)
                     if not raw:
                         pipe.unwatch()
                         return response_error(f"Item: {k} not found!")
+                    current_values[k] = msgpack.decode(raw, type=StockValue)
                     res_val = pipe.get(reserved_keys[k])
                     current_reserved[k] = int(res_val or 0)
 
                 pipe.multi()
                 for k, amount in items.items():
-                    item = msgpack.decode(raw, type=StockValue)
+                    item = current_values[k]
                     item.stock -= int(amount)
                     if item.stock < 0:
                         # The coordinator has already durably logged COMMIT, so
