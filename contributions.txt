@@ -1,1 +1,26 @@
+Contributions
 
+
+Atharva Dagaonkar
+Role: 2PC Lead
+
+- Authored task-split.md and project design documents
+- Implemented 2PC coordinator in order/app.py: checkout_2pc(), _abort_2pc(), recover_2pc()
+- Designed coordinator WAL (COORD_PENDING_KEY) and atomic STATUS_PENDING→STARTED claim via WATCH/MULTI/EXEC
+- Implemented all 2PC participant endpoints (prepare/commit/abort) for both stock and payment services
+- Designed soft-reservation scheme (reserved:stock:{item_id}, reserved:payment:{user_id}) and per-transaction WALs
+- All participant endpoints idempotent via optimistic locking
+- Added concurrent worker guard preventing two gunicorn workers from double-claiming the same order
+- Fixed soft-reservation guards to reject deductions below reserved amounts
+- Wrote 2PC test scripts: mode-switching (07_mode_flag.sh) and end-to-end protocol tests (09_2pc_protocol.sh)
+
+Riya Gupta
+Role:
+
+
+Pranav Gupta
+Role:
+
+
+Jimmy Oei
+Role:
