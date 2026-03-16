@@ -23,4 +23,8 @@ Role:
 
 
 Jimmy Oei
-Role:
+Role: Architect
+
+- Designed and Implemented the Kubernetes deployment architecture
+- Wrote test scripts 6, 11-14, and the kubernetes parts of each test
+- Wrote and fixed test scripts: 06_fault_redis_master.sh (Sentinel failover), 10_redis_aof_persistence.sh (AOF persistence)
