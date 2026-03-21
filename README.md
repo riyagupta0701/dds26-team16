@@ -173,10 +173,16 @@ Configuration is managed via environment variables in `docker-compose.yml` or K8
 |--------|-------------|
 | `01_happy_path.sh` | Full Saga checkout success: stock decreases, credit decreases, order marked `paid`. |
 | `02_idempotency.sh` | Retrying a paid checkout returns 200; retrying a failed checkout returns 400. |
+| `03_compensation_payment_fails.sh` | Payment failure triggers stock compensation; stock fully restored. |
+| `04_compensation_stock_fails.sh` | Out-of-stock checkout fails; stock and credit unchanged. |
 | `05_fault_app_replica.sh` | Kills app replicas; Nginx routes to survivors; checkout always succeeds. |
 | `06_fault_redis_master.sh` | Kills Redis master; Sentinel promotes replica; checkout uninterrupted. |
+| `07_mode_flag.sh` | Switches between Saga and 2PC at runtime; both modes pass end-to-end. |
+| `08_consistency_check.sh` | Fires concurrent checkouts and verifies stock/credit consistency. |
 | `09_2pc_protocol.sh` | Exercises 2PC participant endpoints: prepare/commit/abort idempotency and soft-reservations. |
 | `10_redis_aof_persistence.sh` | Crashes Redis masters and verifies data is restored on restart via AOF. |
+| `11_native_mq_2pc.sh` | Tests 2PC participant protocol directly over MQ (prepare, commit, abort). |
+| `12_orchestrator.sh` | Orchestrator integration tests: saga/2PC flows, concurrency, pause/resume, WAL recovery. |
 
 ## Technology Stack
 

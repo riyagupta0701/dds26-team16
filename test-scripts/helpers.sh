@@ -152,6 +152,18 @@ mq_rpc_2pc() {
   echo "$resp" | tail -n 1 | tr -d '\r'
 }
 
+# Query a key from a service's current Redis master (Sentinel-aware).
+# Usage: redis_get <service> <key>
+#   service: "stock" or "payment"
+#   Returns the value from the actual current master (survives failovers).
+redis_get() {
+  local svc="$1" key="$2"
+  local sentinel_container="dds26-team16-${svc}-redis-sentinel-1"
+  local master_ip
+  master_ip=$(docker exec "$sentinel_container" redis-cli -p 26379 sentinel get-master-addr-by-name "${svc}-master" 2>/dev/null | head -1)
+  docker exec "$sentinel_container" redis-cli -h "$master_ip" -p 6379 -a redis get "$key" 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # Runtime helpers — work in both DEPLOY_MODE=docker and DEPLOY_MODE=kube
 # ---------------------------------------------------------------------------
@@ -163,6 +175,12 @@ _kube_resource() {
     *stock*)         echo "label:component=stock"       ;;
     *payment*)       echo "label:component=payment"     ;;
   esac
+}
+
+# Reload nginx to pick up any DNS changes after container restarts.
+nginx_reload() {
+  docker exec dds26-team16-gateway-1 nginx -s reload > /dev/null 2>&1
+  sleep 1
 }
 
 # Kill one replica of a service.
@@ -203,6 +221,7 @@ service_start() {
     fi
   else
     docker compose start "$svc" > /dev/null 2>&1
+    nginx_reload
   fi
 }
 
@@ -231,6 +250,7 @@ redis_restore() {
       --timeout=60s > /dev/null 2>&1
   else
     docker compose start order-redis-master stock-redis-master payment-redis-master > /dev/null 2>&1
+    nginx_reload
   fi
 }
 

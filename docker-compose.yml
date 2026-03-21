@@ -1,4 +1,94 @@
 services:
+  # ORCHESTRATOR WAL STORE
+  orch-redis-master:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--masterauth", "redis",
+              "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - orch-master-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  orch-redis-replica:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--replicaof", "orch-redis-master", "6379",
+              "--masterauth", "redis", "--maxmemory", "512mb", "--appendonly", "yes"]
+    volumes:
+      - orch-replica-data:/data
+    depends_on:
+      orch-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  orch-redis-sentinel:
+    image: redis:7.2-bookworm
+    command: >
+      sh -c "
+        echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+        echo 'sentinel monitor orch-master orch-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel auth-pass orch-master redis' >> /tmp/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds orch-master 5000' >> /tmp/sentinel.conf &&
+        echo 'sentinel failover-timeout orch-master 10000' >> /tmp/sentinel.conf &&
+        echo 'sentinel parallel-syncs orch-master 1' >> /tmp/sentinel.conf &&
+        redis-server /tmp/sentinel.conf --sentinel --port 26379
+      "
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    depends_on:
+      orch-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ORCHESTRATOR SERVICE
+  orchestrator-1:
+    build: ./orchestrator
+    image: orchestrator
+    environment:
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
+      - ORCH_REDIS_PASSWORD=redis
+      - ORCH_REDIS_DB=0
+      - ORCH_SENTINEL_HOSTS=orch-redis-sentinel:26379
+      - ORCH_MASTER_NAME=orch-master
+      - ORCH_MAX_RETRIES=3
+      - ORCH_TASK_TIMEOUT_S=5
+    depends_on:
+      mq-redis:
+        condition: service_healthy
+      orch-redis-sentinel:
+        condition: service_healthy
+    restart: unless-stopped
+
+  orchestrator-2:
+    build: ./orchestrator
+    image: orchestrator
+    environment:
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
+      - ORCH_REDIS_PASSWORD=redis
+      - ORCH_REDIS_DB=0
+      - ORCH_SENTINEL_HOSTS=orch-redis-sentinel:26379
+      - ORCH_MASTER_NAME=orch-master
+      - ORCH_MAX_RETRIES=3
+      - ORCH_TASK_TIMEOUT_S=5
+    depends_on:
+      mq-redis:
+        condition: service_healthy
+      orch-redis-sentinel:
+        condition: service_healthy
+    restart: unless-stopped
+
   # MESSAGE QUEUE BROKER (Transient)
   mq-redis:
     image: redis:7.2-bookworm
@@ -42,7 +132,7 @@ services:
       - REDIS_DB=0
       - REDIS_SENTINEL_HOSTS=order-redis-sentinel:26379
       - REDIS_MASTER_NAME=order-master
-    command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 70 --log-level=info app:app
     depends_on:
       mq-redis:
         condition: service_healthy
@@ -66,7 +156,7 @@ services:
       - REDIS_DB=0
       - REDIS_SENTINEL_HOSTS=order-redis-sentinel:26379
       - REDIS_MASTER_NAME=order-master
-    command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 70 --log-level=info app:app
     depends_on:
       mq-redis:
         condition: service_healthy
@@ -309,3 +399,5 @@ volumes:
   stock-replica-data:
   payment-master-data:
   payment-replica-data:
+  orch-master-data:
+  orch-replica-data:

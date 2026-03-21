@@ -63,6 +63,9 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
+# Python integration tests (pytest)
+run_test "$SCRIPT_DIR/13_microservices_pytest.sh"
+
 # Core correctness tests (fast, no container killing)
 run_test "$SCRIPT_DIR/01_happy_path.sh"
 run_test "$SCRIPT_DIR/02_idempotency.sh"
@@ -85,6 +88,9 @@ fi
 
 # Mode flag test — switches CHECKOUT_MODE between saga and 2pc (restarts order services)
 run_test "$SCRIPT_DIR/07_mode_flag.sh"
+
+# Orchestrator integration tests (Python unittest — saga, 2PC, concurrency, resilience)
+run_test "$SCRIPT_DIR/12_orchestrator.sh"
 
 # Final summary
 echo ""

@@ -35,8 +35,8 @@ RESP=$(mq_rpc_2pc "events:stock" "prepare_subtract_batch" "$TXN1" "$ITEMS_JSON")
 CODE=$(json_field "$RESP" "status_code")
 assert_eq "A1 prepare_subtract votes YES (200)" "200" "$CODE"
 
-# Check side-effect: reservation exists in stock-redis-master
-RES_VAL=$(docker exec dds26-team16-stock-redis-master-1 redis-cli -a redis get "reserved:stock:$ITEM")
+# Check side-effect: reservation exists in stock Redis (Sentinel-aware)
+RES_VAL=$(redis_get stock "reserved:stock:$ITEM")
 assert_eq "A1 reservation recorded in Redis" "20" "$RES_VAL"
 
 RESP=$(mq_rpc_2pc "events:stock" "commit_subtract_batch" "$TXN1" "$ITEMS_JSON")
@@ -46,7 +46,7 @@ assert_eq "A1 commit_subtract returns 200" "200" "$CODE"
 STOCK_AFTER=$(json_field "$(get_body /stock/find/$ITEM)" "stock")
 assert_eq "A1 stock decreased by 20 after commit (100→80)" "80" "$STOCK_AFTER"
 
-RES_VAL_AFTER=$(docker exec dds26-team16-stock-redis-master-1 redis-cli -a redis get "reserved:stock:$ITEM")
+RES_VAL_AFTER=$(redis_get stock "reserved:stock:$ITEM")
 assert_eq "A1 reservation cleared in Redis" "0" "${RES_VAL_AFTER:-0}"
 
 # A2. commit is idempotent
@@ -85,8 +85,8 @@ TXN5=$(txn "pay-commit")
 RESP=$(mq_rpc_2pc "events:payment" "prepare_pay" "$TXN5" "" "$USER" "40")
 assert_eq "C1 prepare_pay votes YES (200)" "200" "$(json_field "$RESP" "status_code")"
 
-# Check side-effect in payment-redis-master
-RES_VAL=$(docker exec dds26-team16-payment-redis-master-1 redis-cli -a redis get "reserved:payment:$USER")
+# Check side-effect in payment Redis (Sentinel-aware)
+RES_VAL=$(redis_get payment "reserved:payment:$USER")
 assert_eq "C1 credit reservation recorded in Redis" "40" "$RES_VAL"
 
 RESP=$(mq_rpc_2pc "events:payment" "commit_pay" "$TXN5" "" "$USER" "40")
