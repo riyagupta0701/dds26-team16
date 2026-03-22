@@ -28,22 +28,28 @@ A fault-tolerant, distributed e-commerce backend built with Flask microservices,
    │   Order Service    │               │   Order Service    │
    └────────┬───────────┘               └──────────┬─────────┘
             │                                      │
-            │      Redis Streams (MQ) Layer        │
-            │  (events:stock / events:payment)     │
-            └──────────────┬───────────────────────┘
-                           ▼
+            │  ┌──────────────────────────────┐    │
+            └─►│  Orchestrator Service (×2)   │◄───┘
+               │  WAL-backed task execution   │
+               └──────────────┬───────────────┘
+                              │
+            ┌─────────────────┴──────────────────┐
+            │      Redis Streams (MQ) Layer      │
+            │  (events:stock / events:payment)   │
+            └─────────────────┬──────────────────┘
+                              ▼
               ┌─────────────────────────┐
               │     Stock Service       │
               │    Payment Service      │
               └────────────┬────────────┘
                            │
               ┌────────────┴────────────┐
-              │  Redis Master + Replica │  (one pair per service)
-              │  + Sentinel Cluster     │  (order / stock / payment)
+              │  Redis Master + Replica │  (one cluster per service,
+              │  + Sentinel Cluster     │   incl. orchestrator)
               └─────────────────────────┘
 ```
 
-The system is composed of three logical services (Order, Stock, Payment). Each service runs as **2 application replicas** behind a shared Nginx upstream pool. For data persistence and high availability, each service has its own isolated **Redis master + replica + Sentinel** cluster. The complete stack totals 19 containers (16 original + 3 Sentinels).
+The system is composed of three logical services (Order, Stock, Payment) and an **Orchestrator** that coordinates multi-service transactions. Each service runs as **2 application replicas** behind a shared Nginx upstream pool. For data persistence and high availability, each service — including the orchestrator — has its own isolated **Redis master + replica + Sentinel** cluster. The complete stack totals 22 containers.
 
 ### Redis Architecture: State vs. Messaging
 
@@ -53,6 +59,17 @@ To ensure high availability and prevent head-of-line blocking, each service main
 2.  **Messaging Connection (`mq`):** Used for inter-service communication (Redis Streams, Consumer Groups, RPC replies).
 
 These connections are configured via separate environment variables to allow splitting traffic or scaling the messaging layer independently.
+
+### Orchestrator Service
+
+The **Orchestrator** is a standalone service (2 replicas) that executes multi-step transaction workflows on behalf of the Order service. When the Order service initiates a checkout, it submits a **batch** of tasks to the orchestrator via the `events:orchestrator` Redis Stream. The orchestrator:
+
+1.  **Persists the batch to a WAL** (`orch:pending` set + `orch:batch:{id}` key) in its own Sentinel-backed Redis cluster before processing.
+2.  **Dispatches tasks** to participant streams (`events:stock`, `events:payment`) respecting dependency ordering.
+3.  **Collects replies** via temporary `BLPOP` keys and retries failed deliveries (configurable via `ORCH_MAX_RETRIES`).
+4.  **Pushes the final result** back to the Order service's `reply_to` key and cleans up the WAL.
+
+On startup, each orchestrator replica runs a **recovery sweep**: it scans `orch:pending`, acquires distributed locks to prevent duplicate processing, and re-drives any incomplete batches. This ensures crash recovery even if the orchestrator dies mid-transaction.
 
 ## Service Interaction: RPC over Streams
 
@@ -70,12 +87,12 @@ This pattern decouples the services, provides automatic load balancing via Consu
 The active protocol is selected via the `CHECKOUT_MODE` environment variable (`saga` or `2pc`).
 
 ### Saga (Orchestration)
-The Order service orchestrates the flow by sending sequential RPC commands to Stock and Payment. If a step fails (e.g., insufficient credit), the Order service sends **compensating transactions** (rollbacks) to the MQ to restore the system state.
+The Order service submits a batch of tasks (stock subtraction, payment charge) to the **Orchestrator**, which dispatches them sequentially to Stock and Payment via Redis Streams. If a step fails (e.g., insufficient credit), the Order service sends **compensating transactions** (rollbacks) to restore the system state. Each retry attempt uses an **incremental transaction ID** (`{order_id}_{attempt}`) so that tombstones from previous attempts don't block retries.
 
 ### Two-Phase Commit (2PC)
-A high-integrity protocol for atomicity across services.
-*   **Phase 1 (PREPARE):** Order service asks participants to soft-reserve resources. Participants write a WAL (Write-Ahead Log) entry.
-*   **Phase 2 (COMMIT/ABORT):** Once the Order service durably logs the decision to its own Redis (the point of no return), it broadcasts the final result to all participants.
+A high-integrity protocol for atomicity across services, also coordinated through the Orchestrator.
+*   **Phase 1 (PREPARE):** The Orchestrator dispatches prepare tasks to participants, which soft-reserve resources and write WAL entries.
+*   **Phase 2 (COMMIT/ABORT):** Once the Order service durably logs the decision, the Orchestrator broadcasts commit/abort to all participants.
 
 ## Fault Tolerance & Reliability
 
@@ -85,7 +102,7 @@ A critical challenge in distributed systems is message reordering or retries. If
 *   If the original request arrives later, the service sees the Tombstone and ignores the request.
 
 ### Background Recovery
-On startup, each `order-service` replica scans its WAL (`2pc:pending` or `saga:pending`). If it finds transactions that were in-flight during a crash, it deterministically re-drives them to completion (either committing or rolling back).
+On startup, each `order-service` replica scans its WAL (`2pc:pending` or `saga:pending`). If it finds transactions that were in-flight during a crash, it deterministically re-drives them to completion (either committing or rolling back). Similarly, each **orchestrator** replica runs a recovery sweep on startup, scanning `orch:pending` and re-dispatching any incomplete task batches using distributed locks to prevent duplicate processing across replicas.
 
 ### Application Replica Failure
 Nginx upstream pools are configured with `max_fails=1 fail_timeout=5s` and `proxy_next_upstream error timeout http_500 http_502 http_503`. When one replica crashes, Nginx automatically retries the request on the healthy one. All containers use `restart: unless-stopped`.
@@ -115,7 +132,7 @@ All state mutations use Redis `WATCH/MULTI/EXEC` optimistic locking with up to 1
 1.  **Start the stack:**
     ```bash
     docker compose down -v          # wipe old volumes (clean slate)
-    docker compose up --build       # build images and start all 19 containers
+    docker compose up --build       # build images and start all 22 containers
     ```
     The gateway is available at `http://localhost:8000` once all services report healthy (~10–15 seconds).
 
@@ -166,6 +183,12 @@ Configuration is managed via environment variables in `docker-compose.yml` or K8
 | `MQ_REDIS_PORT` | all | Port for the MQ connection | `6379` |
 | `MQ_REDIS_PASSWORD`| all | Password for the MQ connection | `redis` |
 | `MQ_REDIS_DB` | all | DB index for the MQ connection | `0` |
+| `ORCH_SENTINEL_HOSTS` | orchestrator | Sentinel `host:port` for orchestrator WAL Redis | *(optional)* |
+| `ORCH_MASTER_NAME` | orchestrator | Sentinel master set name for orchestrator Redis | `orch-master` |
+| `ORCH_REDIS_HOST` | orchestrator | Direct Redis host (fallback when Sentinel is not used) | *(optional)* |
+| `ORCH_REDIS_PASSWORD` | orchestrator | Orchestrator Redis auth password | `redis` |
+| `ORCH_MAX_RETRIES` | orchestrator | Max retry attempts per task delivery | `3` |
+| `ORCH_TASK_TIMEOUT_S` | orchestrator | Timeout (seconds) waiting for a task reply | `5` |
 
 ## Testing Suite
 
@@ -183,6 +206,7 @@ Configuration is managed via environment variables in `docker-compose.yml` or K8
 | `10_redis_aof_persistence.sh` | Crashes Redis masters and verifies data is restored on restart via AOF. |
 | `11_native_mq_2pc.sh` | Tests 2PC participant protocol directly over MQ (prepare, commit, abort). |
 | `12_orchestrator.sh` | Orchestrator integration tests: saga/2PC flows, concurrency, pause/resume, WAL recovery. |
+| `13_microservices_pytest.sh` | Python integration tests for stock, payment, and order service correctness. |
 
 ## Technology Stack
 
@@ -194,4 +218,5 @@ Configuration is managed via environment variables in `docker-compose.yml` or K8
 | **Data Replication** | Redis Master + Replica + Sentinel |
 | **Serialization** | msgspec (msgpack binary format) |
 | **Load Balancer** | Nginx 1.25 with upstream health tracking |
+| **Orchestration** | WAL-backed task orchestrator with distributed locking and crash recovery |
 | **Reliability** | 2PC, Saga, Tombstones, WAL Recovery, Sentinel Failover |

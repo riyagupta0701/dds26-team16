@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Test 9: 2PC participant protocol — direct tests of prepare/commit/abort
 #
-# These endpoints exist and work regardless of CHECKOUT_MODE.  We test them
-# directly to verify the participant-level protocol without needing to restart
-# any containers.
+# Stock 2PC endpoints are tested via MQ (Redis Streams) since the stock
+# service exposes batch-level 2PC logic only through its MQ listener.
+# Payment 2PC endpoints are tested via HTTP since they have Flask routes.
 #
 # Properties verified:
 #   1. prepare→commit  : resource actually deducted, WAL idempotent
@@ -34,6 +34,14 @@ fresh_item() {
   echo "$id"
 }
 
+# Wrapper: send a stock 2PC RPC and return the status_code from the response.
+stock_2pc() {
+  local action="$1" order_id="$2" items_json="$3"
+  local resp
+  resp=$(mq_rpc_2pc "events:stock" "$action" "$order_id" "$items_json")
+  json_field "$resp" "status_code"
+}
+
 # ── Section A: Stock participant ──────────────────────────────────────────────
 
 yellow "[ A ] Stock participant — prepare / commit / abort"
@@ -47,46 +55,46 @@ TXN3=$(txn "never-prepared")
 TXN4=$(txn "noresource")
 
 # A1. prepare → commit: stock must decrease by the committed amount.
-CODE=$(post "/stock/prepare_subtract/$TXN1/$ITEM/20")
-assert_http "A1 prepare_subtract votes YES (200)" "200" "$CODE"
+CODE=$(stock_2pc "prepare_subtract_batch" "$TXN1" "{\"$ITEM\": 20}")
+assert_eq "A1 prepare_subtract votes YES (200)" "200" "$CODE"
 
 # Visible stock is unchanged before commit (reservation is soft).
 STOCK_MID=$(json_field "$(get_body /stock/find/$ITEM)" "stock")
 assert_eq "A1 stock unchanged before commit (still 100)" "100" "$STOCK_MID"
 
-CODE=$(post "/stock/commit_subtract/$TXN1/$ITEM/20")
-assert_http "A1 commit_subtract returns 200" "200" "$CODE"
+CODE=$(stock_2pc "commit_subtract_batch" "$TXN1" "{\"$ITEM\": 20}")
+assert_eq "A1 commit_subtract returns 200" "200" "$CODE"
 
 STOCK_AFTER_COMMIT=$(json_field "$(get_body /stock/find/$ITEM)" "stock")
 assert_eq "A1 stock decreased by 20 after commit (100→80)" "80" "$STOCK_AFTER_COMMIT"
 
 # A2. commit is idempotent: calling again must not double-deduct.
-CODE=$(post "/stock/commit_subtract/$TXN1/$ITEM/20")
-assert_http "A2 commit_subtract idempotent (200)" "200" "$CODE"
+CODE=$(stock_2pc "commit_subtract_batch" "$TXN1" "{\"$ITEM\": 20}")
+assert_eq "A2 commit_subtract idempotent (200)" "200" "$CODE"
 STOCK_IDEMPOTENT=$(json_field "$(get_body /stock/find/$ITEM)" "stock")
 assert_eq "A2 idempotent commit does not double-deduct (still 80)" "80" "$STOCK_IDEMPOTENT"
 
 # A3. prepare → abort: stock must remain unchanged.
-CODE=$(post "/stock/prepare_subtract/$TXN2/$ITEM/15")
-assert_http "A3 prepare before abort returns 200" "200" "$CODE"
+CODE=$(stock_2pc "prepare_subtract_batch" "$TXN2" "{\"$ITEM\": 15}")
+assert_eq "A3 prepare before abort returns 200" "200" "$CODE"
 
-CODE=$(post "/stock/abort_subtract/$TXN2/$ITEM/15")
-assert_http "A3 abort_subtract returns 200" "200" "$CODE"
+CODE=$(stock_2pc "abort_subtract_batch" "$TXN2" "{\"$ITEM\": 15}")
+assert_eq "A3 abort_subtract returns 200" "200" "$CODE"
 
 STOCK_AFTER_ABORT=$(json_field "$(get_body /stock/find/$ITEM)" "stock")
 assert_eq "A3 stock unchanged after abort (still 80)" "80" "$STOCK_AFTER_ABORT"
 
 # A4. abort is idempotent.
-CODE=$(post "/stock/abort_subtract/$TXN2/$ITEM/15")
-assert_http "A4 abort_subtract idempotent (200)" "200" "$CODE"
+CODE=$(stock_2pc "abort_subtract_batch" "$TXN2" "{\"$ITEM\": 15}")
+assert_eq "A4 abort_subtract idempotent (200)" "200" "$CODE"
 
 # A5. abort on never-prepared txn returns 200 (safe for recovery re-drives).
-CODE=$(post "/stock/abort_subtract/$TXN3/$ITEM/10")
-assert_http "A5 abort on un-prepared txn returns 200 (no-op)" "200" "$CODE"
+CODE=$(stock_2pc "abort_subtract_batch" "$TXN3" "{\"$ITEM\": 10}")
+assert_eq "A5 abort on un-prepared txn returns 200 (no-op)" "200" "$CODE"
 
 # A6. prepare votes NO when stock is insufficient.
-CODE=$(post "/stock/prepare_subtract/$TXN4/$ITEM/99999")
-assert_http "A6 prepare votes NO on insufficient stock (400)" "400" "$CODE"
+CODE=$(stock_2pc "prepare_subtract_batch" "$TXN4" "{\"$ITEM\": 99999}")
+assert_eq "A6 prepare votes NO on insufficient stock (400)" "400" "$CODE"
 
 # ── Section B: Reservation blocks concurrent double-spend ─────────────────────
 
@@ -99,24 +107,24 @@ TXN_A=$(txn "ds-A")
 TXN_B=$(txn "ds-B")
 
 # B1. First prepare uses 8 of 10 units → succeeds.
-CODE=$(post "/stock/prepare_subtract/$TXN_A/$ITEM2/8")
-assert_http "B1 first prepare (8/10) votes YES (200)" "200" "$CODE"
+CODE=$(stock_2pc "prepare_subtract_batch" "$TXN_A" "{\"$ITEM2\": 8}")
+assert_eq "B1 first prepare (8/10) votes YES (200)" "200" "$CODE"
 
 # B2. Second prepare requests 5 units; only 2 unreserved → must fail.
-CODE=$(post "/stock/prepare_subtract/$TXN_B/$ITEM2/5")
-assert_http "B2 second prepare (5/10, 8 reserved) votes NO (400)" "400" "$CODE"
+CODE=$(stock_2pc "prepare_subtract_batch" "$TXN_B" "{\"$ITEM2\": 5}")
+assert_eq "B2 second prepare (5/10, 8 reserved) votes NO (400)" "400" "$CODE"
 
 # B3. After aborting the first prepare the reservation is freed.
-CODE=$(post "/stock/abort_subtract/$TXN_A/$ITEM2/8")
-assert_http "B3 abort first prepare returns 200" "200" "$CODE"
+CODE=$(stock_2pc "abort_subtract_batch" "$TXN_A" "{\"$ITEM2\": 8}")
+assert_eq "B3 abort first prepare returns 200" "200" "$CODE"
 
 # B4. Now the second prepare should succeed (10 unreserved again).
-CODE=$(post "/stock/prepare_subtract/$TXN_B/$ITEM2/5")
-assert_http "B4 second prepare succeeds after first aborted (200)" "200" "$CODE"
+CODE=$(stock_2pc "prepare_subtract_batch" "$TXN_B" "{\"$ITEM2\": 5}")
+assert_eq "B4 second prepare succeeds after first aborted (200)" "200" "$CODE"
 
 # Clean up: commit TXN_B so the reservation doesn't leak into other tests.
-CODE=$(post "/stock/commit_subtract/$TXN_B/$ITEM2/5")
-assert_http "B4 cleanup commit returns 200" "200" "$CODE"
+CODE=$(stock_2pc "commit_subtract_batch" "$TXN_B" "{\"$ITEM2\": 5}")
+assert_eq "B4 cleanup commit returns 200" "200" "$CODE"
 
 # ── Section C: Payment participant ────────────────────────────────────────────
 
