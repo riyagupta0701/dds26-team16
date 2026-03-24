@@ -21,7 +21,7 @@ services:
   wal-redis-replica:
     image: redis:7.2-bookworm
     command: ["redis-server", "--requirepass", "redis", "--replicaof", "wal-redis-master", "6379",
-              "--masterauth", "redis", "--maxmemory", "256mb", "--appendonly", "yes", "--appendfsync", "always"]
+              "--masterauth", "redis", "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "always"]
     volumes:
       - wal-replica-data:/data
     depends_on:
