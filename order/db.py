@@ -10,8 +10,10 @@ STATUS_STARTED = "started"
 STATUS_PAID    = "paid"
 STATUS_FAILED  = "failed"
 
-COORD_PENDING_KEY = "2pc:pending"
-SAGA_PENDING_KEY  = "saga:pending"
+# WAL keys now live in wal-redis (imported from wal.py).
+# These names are kept here as aliases so the rest of the codebase
+# can import them from db without touching their call sites.
+from wal import COORD_PENDING_KEY, SAGA_PENDING_KEY  # noqa: E402
 
 # ── Connections ────────────────────────────────────────────────────────────────
 _REDIS_PASSWORD    = os.environ.get('REDIS_PASSWORD', '')
@@ -72,11 +74,30 @@ def get_order(order_id: str) -> OrderValue:
 def save_order(order_id: str, order: OrderValue, *,
                wal_add: str | None = None,
                wal_remove: str | None = None):
-    """Atomically persist order with an optional WAL set update. Raises RedisError."""
-    with db.pipeline(transaction=True) as pipe:
-        pipe.set(order_id, msgpack.encode(order))
+    """
+    Persist order to business-data Redis.
+    WAL set updates (wal_add / wal_remove) go to the decoupled wal-redis.
+
+    Order of operations:
+      1. Write order to db (business Redis) atomically.
+      2. Update WAL set in wal-redis separately.
+    Step 2 is best-effort only for wal_remove (cleanup); for wal_add it
+    is required — callers should treat a RedisError on wal_add as fatal.
+    """
+    from wal import wal as _wal
+
+    # Step 1: persist business data
+    try:
+        db.set(order_id, msgpack.encode(order))
+    except redis.exceptions.RedisError:
+        raise  # caller handles
+
+    # Step 2: update WAL in separate store
+    try:
         if wal_add:
-            pipe.sadd(wal_add, order_id)
+            _wal.sadd(wal_add, order_id)
         if wal_remove:
-            pipe.srem(wal_remove, order_id)
-        pipe.execute()
+            _wal.srem(wal_remove, order_id)
+    except redis.exceptions.RedisError:
+        if wal_add:
+            raise  # cannot afford to lose a WAL entry on add

@@ -82,6 +82,7 @@ if [ "${SKIP_FAULT_TESTS:-0}" != "1" ]; then
   run_test "$SCRIPT_DIR/05_fault_app_replica.sh"
   run_test "$SCRIPT_DIR/06_fault_redis_master.sh"
   run_test "$SCRIPT_DIR/10_redis_aof_persistence.sh"
+  run_test "$SCRIPT_DIR/14_wal_decoupled.sh"
 else
   echo ""
   echo -e "${YELLOW}→  Skipping fault tests (SKIP_FAULT_TESTS=1)${RESET}"

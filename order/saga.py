@@ -7,12 +7,10 @@ from msgspec import msgpack
 from db import (db, OrderValue, get_order, save_order,
                 STATUS_PAID, STATUS_FAILED, STATUS_STARTED,
                 SAGA_PENDING_KEY, DB_ERROR_STR)
+from wal import wal, SAGA_TX_PREFIX, SAGA_ATTEMPT_PREFIX
 from rpc import submit_batch, recovery_rpc, task_ok, task_error
 
 log = logging.getLogger('order-service')
-
-SAGA_TX_PREFIX = "saga:tx:"           # + order_id → per-attempt transaction_id
-SAGA_ATTEMPT_PREFIX = "saga:attempt:" # + order_id → monotonic attempt counter
 
 
 # ── Task graph ─────────────────────────────────────────────────────────────────
@@ -50,9 +48,9 @@ def checkout_saga(order_id: str) -> Response:
 
     # Fresh transaction ID per attempt so tombstones don't block retries.
     try:
-        attempt = db.incr(f"{SAGA_ATTEMPT_PREFIX}{order_id}")
+        attempt = wal.incr(f"{SAGA_ATTEMPT_PREFIX}{order_id}")
         tx_id = f"{order_id}_{attempt}"
-        db.set(f"{SAGA_TX_PREFIX}{order_id}", tx_id)
+        wal.set(f"{SAGA_TX_PREFIX}{order_id}", tx_id)
     except redis.exceptions.RedisError:
         abort(500, DB_ERROR_STR)
 
@@ -100,7 +98,7 @@ def checkout_saga(order_id: str) -> Response:
 
 def recover_saga():
     try:
-        pending = db.smembers(SAGA_PENDING_KEY)
+        pending = wal.smembers(SAGA_PENDING_KEY)
     except redis.exceptions.RedisError as e:
         log.error("Saga recovery: cannot read WAL: %s", e)
         return
@@ -111,24 +109,24 @@ def recover_saga():
 
     for raw_id in pending:
         order_id = raw_id.decode()
-        lock_key = f"recovery_lock_saga:{order_id}"
-        if not db.set(lock_key, "locked", nx=True, ex=30):
+        lock_key = f"wal:order:saga:recovery_lock:{order_id}"
+        if not wal.set(lock_key, "locked", nx=True, ex=30):
             continue
 
         try:
             raw = db.get(order_id)
             if not raw:
-                db.srem(SAGA_PENDING_KEY, order_id)
+                wal.srem(SAGA_PENDING_KEY, order_id)
                 continue
 
             order = msgpack.decode(raw, type=OrderValue)
 
             if order.status != STATUS_STARTED:
-                db.srem(SAGA_PENDING_KEY, order_id)
+                wal.srem(SAGA_PENDING_KEY, order_id)
                 continue
 
-            # Read per-attempt tx_id; fall back to order_id for backward compat.
-            raw_tx = db.get(f"{SAGA_TX_PREFIX}{order_id}")
+            # Read per-attempt tx_id from WAL store; fall back to order_id.
+            raw_tx = wal.get(f"{SAGA_TX_PREFIX}{order_id}")
             tx_id = raw_tx.decode() if raw_tx else order_id
 
             log.warning("Saga recovery: rolling back order %s (tx=%s)", order_id, tx_id)
@@ -146,4 +144,4 @@ def recover_saga():
         except Exception as e:
             log.error("Saga recovery: error processing %s: %s", order_id, e)
         finally:
-            db.delete(lock_key)
+            wal.delete(lock_key)

@@ -13,12 +13,13 @@ from msgspec import msgpack
 
 from db import (db, mq, OrderValue, get_order,
                 STATUS_PENDING, DB_ERROR_STR)
+from wal import wal
 from rpc import send_rpc
 from saga import checkout_saga, recover_saga
 from twopc import checkout_2pc, recover_2pc
 
 app = Flask("order-service")
-atexit.register(lambda: (db.close(), mq.close()))
+atexit.register(lambda: (db.close(), mq.close(), wal.close()))
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
