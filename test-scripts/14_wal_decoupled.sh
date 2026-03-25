@@ -3,12 +3,18 @@
 # business-data Redis, and survive killing the business-data container.
 #
 # What this proves:
-#   1. After a checkout, WAL keys exist in wal-redis (wal:order:*, wal:stock:*,
-#      wal:payment:*)  and are ABSENT from order-redis, stock-redis, payment-redis.
+#   1. After a checkout, NEW WAL keys appear only in wal-redis, not in
+#      order-redis, stock-redis, or payment-redis.
 #   2. Killing order-redis-master does NOT destroy the WAL — wal-redis still
 #      holds all entries, so recovery can resume without data loss.
 #   3. After order-redis-master restarts, a fresh checkout succeeds, confirming
 #      the whole stack (including WAL recovery) is working again.
+#
+# NOTE: This test uses a delta approach for key-placement checks. It snapshots
+# keys in each business-data Redis BEFORE the checkout, runs the checkout, then
+# asserts no NEW WAL-format keys were added. This makes the test robust against
+# leftover keys from previous runs (e.g. when volumes were not wiped between
+# deployments). For a fully clean run: docker compose down -v && up --build.
 #
 # Only runs in DEPLOY_MODE=docker (direct container control required).
 source "$(dirname "$0")/helpers.sh"
@@ -38,14 +44,22 @@ ORDER_ID=$(create_order_with_item "$USER_ID" 0 1)
 CODE=$(post "/orders/mode/2pc")
 assert_http "Switch to 2PC mode" "200" "$CODE"
 
+# ── Snapshot keys in each business-data Redis BEFORE the checkout ─────────────
+# We diff before/after so leftover keys from prior runs don't cause false fails.
+ORDER_BEFORE=$($ORDER_CLI keys "wal:*"       2>/dev/null | sort)
+STOCK_BEFORE_WAL=$($STOCK_CLI keys "wal:*"        2>/dev/null | sort)
+STOCK_BEFORE_OLD=$($STOCK_CLI keys "2pc:stock:*"  2>/dev/null | sort)
+PAY_BEFORE_WAL=$($PAYMENT_CLI keys "wal:*"          2>/dev/null | sort)
+PAY_BEFORE_OLD=$($PAYMENT_CLI keys "2pc:payment:*"  2>/dev/null | sort)
+
 CODE=$(post "/orders/checkout/$ORDER_ID")
 assert_http "2PC checkout returns 200" "200" "$CODE"
 
+# ── Check wal-redis received entries ──────────────────────────────────────────
 yellow "Checking wal-redis for WAL keys..."
 WAL_KEYS=$($WAL_CLI keys "wal:*" 2>/dev/null | tr '\r\n' ' ')
 yellow "wal-redis keys: $WAL_KEYS"
 
-# There should be at least one wal: key (saga/2pc pending sets or tx states)
 if echo "$WAL_KEYS" | grep -q "wal:"; then
   green "WAL keys found in wal-redis: PASS"
   PASS=$((PASS+1))
@@ -54,13 +68,15 @@ else
   FAIL=$((FAIL+1))
 fi
 
+# ── Check order-redis received no new wal: keys ───────────────────────────────
 yellow "Confirming WAL keys are ABSENT from order-redis..."
-ORDER_WAL=$($ORDER_CLI keys "wal:*" 2>/dev/null | grep -v "^$" | head -5)
-if [ -z "$ORDER_WAL" ]; then
-  green "order-redis has no wal: keys — correctly separated: PASS"
+ORDER_AFTER=$($ORDER_CLI keys "wal:*" 2>/dev/null | sort)
+ORDER_NEW=$(comm -13 <(echo "$ORDER_BEFORE") <(echo "$ORDER_AFTER") | grep -v "^$")
+if [ -z "$ORDER_NEW" ]; then
+  green "order-redis gained no wal: keys — correctly separated: PASS"
   PASS=$((PASS+1))
 else
-  red "order-redis unexpectedly contains wal: keys: $ORDER_WAL"
+  red "order-redis gained new wal: keys during checkout: $ORDER_NEW"
   FAIL=$((FAIL+1))
 fi
 
@@ -75,25 +91,33 @@ else
   FAIL=$((FAIL+1))
 fi
 
-yellow "Confirming 2PC WAL keys absent from stock-redis..."
-STOCK_WAL=$($STOCK_CLI keys "wal:*" 2>/dev/null; $STOCK_CLI keys "2pc:stock:*" 2>/dev/null)
-STOCK_WAL=$(echo "$STOCK_WAL" | grep -v "^$" | head -5)
-if [ -z "$STOCK_WAL" ]; then
-  green "stock-redis has no WAL keys — correctly separated: PASS"
+# ── Check stock-redis received no new WAL keys ────────────────────────────────
+yellow "Confirming no new 2PC WAL keys written to stock-redis during checkout..."
+STOCK_AFTER_WAL=$($STOCK_CLI keys "wal:*"       2>/dev/null | sort)
+STOCK_AFTER_OLD=$($STOCK_CLI keys "2pc:stock:*" 2>/dev/null | sort)
+STOCK_NEW_WAL=$(comm -13 <(echo "$STOCK_BEFORE_WAL") <(echo "$STOCK_AFTER_WAL") | grep -v "^$")
+STOCK_NEW_OLD=$(comm -13 <(echo "$STOCK_BEFORE_OLD") <(echo "$STOCK_AFTER_OLD") | grep -v "^$")
+STOCK_NEW=$(printf "%s\n%s" "$STOCK_NEW_WAL" "$STOCK_NEW_OLD" | grep -v "^$")
+if [ -z "$STOCK_NEW" ]; then
+  green "stock-redis gained no WAL keys during checkout — correctly separated: PASS"
   PASS=$((PASS+1))
 else
-  red "stock-redis unexpectedly contains WAL keys: $STOCK_WAL"
+  red "stock-redis gained new WAL keys during checkout (expected only in wal-redis): $STOCK_NEW"
   FAIL=$((FAIL+1))
 fi
 
-yellow "Confirming 2PC WAL keys absent from payment-redis..."
-PAYMENT_WAL=$($PAYMENT_CLI keys "wal:*" 2>/dev/null; $PAYMENT_CLI keys "2pc:payment:*" 2>/dev/null)
-PAYMENT_WAL=$(echo "$PAYMENT_WAL" | grep -v "^$" | head -5)
-if [ -z "$PAYMENT_WAL" ]; then
-  green "payment-redis has no WAL keys — correctly separated: PASS"
+# ── Check payment-redis received no new WAL keys ──────────────────────────────
+yellow "Confirming no new 2PC WAL keys written to payment-redis during checkout..."
+PAY_AFTER_WAL=$($PAYMENT_CLI keys "wal:*"          2>/dev/null | sort)
+PAY_AFTER_OLD=$($PAYMENT_CLI keys "2pc:payment:*"  2>/dev/null | sort)
+PAY_NEW_WAL=$(comm -13 <(echo "$PAY_BEFORE_WAL") <(echo "$PAY_AFTER_WAL") | grep -v "^$")
+PAY_NEW_OLD=$(comm -13 <(echo "$PAY_BEFORE_OLD") <(echo "$PAY_AFTER_OLD") | grep -v "^$")
+PAY_NEW=$(printf "%s\n%s" "$PAY_NEW_WAL" "$PAY_NEW_OLD" | grep -v "^$")
+if [ -z "$PAY_NEW" ]; then
+  green "payment-redis gained no WAL keys during checkout — correctly separated: PASS"
   PASS=$((PASS+1))
 else
-  red "payment-redis unexpectedly contains WAL keys: $PAYMENT_WAL"
+  red "payment-redis gained new WAL keys during checkout (expected only in wal-redis): $PAY_NEW"
   FAIL=$((FAIL+1))
 fi
 
@@ -101,7 +125,6 @@ fi
 
 header "Part B — WAL survives order-redis-master crash"
 
-# Start a checkout in saga mode, capture its WAL entry before any crash
 CODE=$(post "/orders/mode/saga")
 assert_http "Switch back to saga mode" "200" "$CODE"
 
@@ -147,7 +170,6 @@ for i in $(seq 1 20); do
   sleep 2
 done
 
-# Wait for services to reconnect
 sleep 5
 
 # ── Part C: System works after recovery ───────────────────────────────────────
@@ -162,7 +184,6 @@ assert_http "Checkout succeeds after order-redis recovery" "200" "$CODE"
 STATUS=$(json_field "$(get_body /orders/find/$ORDER3)" "status")
 assert_eq "Order marked paid after recovery" "paid" "$STATUS"
 
-# Switch back to saga for subsequent tests
 post "/orders/mode/saga" > /dev/null 2>&1
 
 summary
@@ -175,10 +196,6 @@ yellow "Checking wal-redis for orchestrator WAL keys after checkout..."
 ORCH_WAL_KEYS=$($WAL_CLI keys "wal:orch:*" 2>/dev/null | tr '\r\n' ' ')
 yellow "wal:orch:* keys found: ${ORCH_WAL_KEYS:-<none — completed batches cleaned up>}"
 
-# wal:orch:batch:* keys may have been cleaned up if the checkout completed
-# normally (complete_batch sets a 24h TTL and removes from pending).
-# So we check that wal-redis is responsive and that no orch WAL keys live
-# in mq-redis (where they must not be).
 MQ_CLI="docker compose exec -T mq-redis redis-cli -a redis --no-auth-warning"
 
 MISPLACED=$($MQ_CLI keys "wal:orch:*" 2>/dev/null | grep -v "^$" | head -5)
@@ -206,7 +223,6 @@ fi
 yellow "Restarting orchestrators..."
 docker compose start orchestrator-1 orchestrator-2 > /dev/null 2>&1
 
-# Wait for orchestrators to come back up and run recovery
 sleep 8
 
 yellow "Verifying checkout works after orchestrator restart (recovery ran)..."
