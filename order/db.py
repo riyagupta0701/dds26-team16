@@ -75,29 +75,34 @@ def save_order(order_id: str, order: OrderValue, *,
                wal_add: str | None = None,
                wal_remove: str | None = None):
     """
-    Persist order to business-data Redis.
-    WAL set updates (wal_add / wal_remove) go to the decoupled wal-redis.
+    Persist order to business-data Redis with optional WAL set updates.
 
-    Order of operations:
-      1. Write order to db (business Redis) atomically.
-      2. Update WAL set in wal-redis separately.
-    Step 2 is best-effort only for wal_remove (cleanup); for wal_add it
-    is required — callers should treat a RedisError on wal_add as fatal.
+    WAL-before-act ordering:
+      1. Write WAL entry to wal-redis first (if wal_add is set).
+      2. Write order to db-redis.
+      3. Remove WAL entry from wal-redis (if wal_remove is set, best-effort).
     """
     from wal import wal as _wal
 
-    # Step 1: persist business data
-    try:
-        db.set(order_id, msgpack.encode(order))
-    except redis.exceptions.RedisError:
-        raise  # caller handles
-
-    # Step 2: update WAL in separate store
+    # Step 1: write WAL entry before touching db
     try:
         if wal_add:
             _wal.sadd(wal_add, order_id)
-        if wal_remove:
-            _wal.srem(wal_remove, order_id)
     except redis.exceptions.RedisError:
-        if wal_add:
-            raise  # cannot afford to lose a WAL entry on add
+        raise  # cannot proceed without a WAL entry
+
+    # Step 2: persist business data
+    try:
+        db.set(order_id, msgpack.encode(order))
+    except redis.exceptions.RedisError:
+        # db write failed — the WAL entry we just added is an orphan.
+        # Recovery will find it, read STATUS_PENDING (unchanged) or a missing
+        # order in db, and clean up safely. Re-raise so the caller aborts.
+        raise
+
+    # Step 3: best-effort WAL cleanup
+    if wal_remove:
+        try:
+            _wal.srem(wal_remove, order_id)
+        except redis.exceptions.RedisError:
+            pass  # non-fatal: recovery will clean up on next startup

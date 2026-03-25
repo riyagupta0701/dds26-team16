@@ -395,16 +395,23 @@ def prepare_subtract_batch_logic(order_id: str, items_json: str):
     try:
         wal.set(wal_key, WAL_PREPARED)
     except redis.exceptions.RedisError:
-        # WAL write failed — roll back the soft-reserve we just applied
-        try:
-            with db.pipeline(transaction=True) as pipe:
-                pipe.multi()
-                for k, amount in items.items():
-                    reserved = int(db.get(reserved_keys[k]) or 0)
-                    pipe.set(reserved_keys[k], max(0, reserved - int(amount)))
-                pipe.execute()
-        except Exception:
-            pass
+        # WAL write failed — roll back the soft-reserve we just applied.
+        # Use a proper WATCH/MULTI/EXEC so the rollback is atomic and another
+        # writer cannot corrupt the reservation counter between our read and write.
+        for _ in range(5):
+            try:
+                with db.pipeline() as pipe:
+                    pipe.watch(*reserved_keys.values())
+                    current = {k: int(pipe.get(reserved_keys[k]) or 0) for k in items}
+                    pipe.multi()
+                    for k, amount in items.items():
+                        pipe.set(reserved_keys[k], max(0, current[k] - int(amount)))
+                    pipe.execute()
+                    break
+            except redis.WatchError:
+                continue
+            except Exception:
+                break
         return response_error(DB_ERROR_STR, 500)
 
     return response_success("Prepare batch: OK")
