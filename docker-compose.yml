@@ -1,11 +1,16 @@
 services:
-  # ORCHESTRATOR WAL STORE
-  orch-redis-master:
+  # ── SHARED WAL STORE ────────────────────────────────────────────────────────
+  # A dedicated Redis cluster whose sole job is to store Write-Ahead Log
+  # entries for order, stock, and payment services. Kept intentionally separate
+  # from every service's business-data Redis so WAL entries survive even if a
+  # service's own data store fails or is wiped.
+  # --appendfsync always guarantees every WAL append is fsynced to disk.
+  wal-redis-master:
     image: redis:7.2-bookworm
     command: ["redis-server", "--requirepass", "redis", "--masterauth", "redis",
-              "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "everysec"]
+              "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "always"]
     volumes:
-      - orch-master-data:/data
+      - wal-master-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "redis", "ping"]
       interval: 2s
@@ -13,27 +18,27 @@ services:
       retries: 10
     restart: unless-stopped
 
-  orch-redis-replica:
+  wal-redis-replica:
     image: redis:7.2-bookworm
-    command: ["redis-server", "--requirepass", "redis", "--replicaof", "orch-redis-master", "6379",
-              "--masterauth", "redis", "--maxmemory", "512mb", "--appendonly", "yes"]
+    command: ["redis-server", "--requirepass", "redis", "--replicaof", "wal-redis-master", "6379",
+              "--masterauth", "redis", "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "always"]
     volumes:
-      - orch-replica-data:/data
+      - wal-replica-data:/data
     depends_on:
-      orch-redis-master:
+      wal-redis-master:
         condition: service_healthy
     restart: unless-stopped
 
-  orch-redis-sentinel:
+  wal-redis-sentinel:
     image: redis:7.2-bookworm
     command: >
       sh -c "
         echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
-        echo 'sentinel monitor orch-master orch-redis-master 6379 1' >> /tmp/sentinel.conf &&
-        echo 'sentinel auth-pass orch-master redis' >> /tmp/sentinel.conf &&
-        echo 'sentinel down-after-milliseconds orch-master 5000' >> /tmp/sentinel.conf &&
-        echo 'sentinel failover-timeout orch-master 10000' >> /tmp/sentinel.conf &&
-        echo 'sentinel parallel-syncs orch-master 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel monitor wal-master wal-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel auth-pass wal-master redis' >> /tmp/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds wal-master 5000' >> /tmp/sentinel.conf &&
+        echo 'sentinel failover-timeout wal-master 10000' >> /tmp/sentinel.conf &&
+        echo 'sentinel parallel-syncs wal-master 1' >> /tmp/sentinel.conf &&
         redis-server /tmp/sentinel.conf --sentinel --port 26379
       "
     healthcheck:
@@ -42,7 +47,7 @@ services:
       timeout: 3s
       retries: 15
     depends_on:
-      orch-redis-master:
+      wal-redis-master:
         condition: service_healthy
     restart: unless-stopped
 
@@ -55,16 +60,20 @@ services:
       - MQ_REDIS_PORT=6379
       - MQ_REDIS_PASSWORD=redis
       - MQ_REDIS_DB=0
-      - ORCH_REDIS_PASSWORD=redis
-      - ORCH_REDIS_DB=0
-      - ORCH_SENTINEL_HOSTS=orch-redis-sentinel:26379
-      - ORCH_MASTER_NAME=orch-master
+      # Decoupled WAL store — same shared wal-redis used by all services
+      - WAL_REDIS_HOST=wal-redis-master
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_MASTER_NAME=wal-master
       - ORCH_MAX_RETRIES=3
       - ORCH_TASK_TIMEOUT_S=5
+      - ORCH_CONSUMER_NAME=orchestrator-1
     depends_on:
       mq-redis:
         condition: service_healthy
-      orch-redis-sentinel:
+      wal-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -76,16 +85,19 @@ services:
       - MQ_REDIS_PORT=6379
       - MQ_REDIS_PASSWORD=redis
       - MQ_REDIS_DB=0
-      - ORCH_REDIS_PASSWORD=redis
-      - ORCH_REDIS_DB=0
-      - ORCH_SENTINEL_HOSTS=orch-redis-sentinel:26379
-      - ORCH_MASTER_NAME=orch-master
+      - WAL_REDIS_HOST=wal-redis-master
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_MASTER_NAME=wal-master
       - ORCH_MAX_RETRIES=3
       - ORCH_TASK_TIMEOUT_S=5
+      - ORCH_CONSUMER_NAME=orchestrator-2
     depends_on:
       mq-redis:
         condition: service_healthy
-      orch-redis-sentinel:
+      wal-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -132,11 +144,20 @@ services:
       - REDIS_DB=0
       - REDIS_SENTINEL_HOSTS=order-redis-sentinel:26379
       - REDIS_MASTER_NAME=order-master
+      # Decoupled WAL store — separate from business data Redis
+      - WAL_REDIS_HOST=wal-redis-master
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_MASTER_NAME=wal-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 70 --log-level=info app:app
     depends_on:
       mq-redis:
         condition: service_healthy
       order-redis-sentinel:
+        condition: service_healthy
+      wal-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -156,11 +177,19 @@ services:
       - REDIS_DB=0
       - REDIS_SENTINEL_HOSTS=order-redis-sentinel:26379
       - REDIS_MASTER_NAME=order-master
+      - WAL_REDIS_HOST=wal-redis-master
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_MASTER_NAME=wal-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 70 --log-level=info app:app
     depends_on:
       mq-redis:
         condition: service_healthy
       order-redis-sentinel:
+        condition: service_healthy
+      wal-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -225,11 +254,19 @@ services:
       - REDIS_DB=0
       - REDIS_SENTINEL_HOSTS=stock-redis-sentinel:26379
       - REDIS_MASTER_NAME=stock-master
+      - WAL_REDIS_HOST=wal-redis-master
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_MASTER_NAME=wal-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
       mq-redis:
         condition: service_healthy
       stock-redis-sentinel:
+        condition: service_healthy
+      wal-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -247,11 +284,19 @@ services:
       - REDIS_DB=0
       - REDIS_SENTINEL_HOSTS=stock-redis-sentinel:26379
       - REDIS_MASTER_NAME=stock-master
+      - WAL_REDIS_HOST=wal-redis-master
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_MASTER_NAME=wal-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
       mq-redis:
         condition: service_healthy
       stock-redis-sentinel:
+        condition: service_healthy
+      wal-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -316,11 +361,19 @@ services:
       - REDIS_DB=0
       - REDIS_SENTINEL_HOSTS=payment-redis-sentinel:26379
       - REDIS_MASTER_NAME=payment-master
+      - WAL_REDIS_HOST=wal-redis-master
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_MASTER_NAME=wal-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
       mq-redis:
         condition: service_healthy
       payment-redis-sentinel:
+        condition: service_healthy
+      wal-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -338,11 +391,19 @@ services:
       - REDIS_DB=0
       - REDIS_SENTINEL_HOSTS=payment-redis-sentinel:26379
       - REDIS_MASTER_NAME=payment-master
+      - WAL_REDIS_HOST=wal-redis-master
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_MASTER_NAME=wal-master
     command: gunicorn -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     depends_on:
       mq-redis:
         condition: service_healthy
       payment-redis-sentinel:
+        condition: service_healthy
+      wal-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -393,11 +454,11 @@ services:
     restart: unless-stopped
 
 volumes:
+  wal-master-data:
+  wal-replica-data:
   order-master-data:
   order-replica-data:
   stock-master-data:
   stock-replica-data:
   payment-master-data:
   payment-replica-data:
-  orch-master-data:
-  orch-replica-data:

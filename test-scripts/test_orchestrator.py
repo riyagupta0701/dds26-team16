@@ -27,7 +27,7 @@ COMPOSE_PROJECT = "dds26-team16"
 ORCHESTRATOR_CTR_1 = f"{COMPOSE_PROJECT}-orchestrator-1-1"
 ORCHESTRATOR_CTR_2 = f"{COMPOSE_PROJECT}-orchestrator-2-1"
 ORCHESTRATOR_CTR = ORCHESTRATOR_CTR_1  # primary for single-container ops
-ORCH_REDIS_SENTINEL_CTR = f"{COMPOSE_PROJECT}-orch-redis-sentinel-1"
+WAL_REDIS_SENTINEL_CTR = f"{COMPOSE_PROJECT}-wal-redis-sentinel-1"
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -110,22 +110,22 @@ def docker_available() -> bool:
         return False
 
 
-def _orch_master_ip() -> str:
-    """Resolve the current orch-redis master IP via Sentinel."""
-    r = _docker("exec", ORCH_REDIS_SENTINEL_CTR,
-                "redis-cli", "-p", "26379", "sentinel", "get-master-addr-by-name", "orch-master")
+def _wal_master_ip() -> str:
+    """Resolve the current wal-redis master IP via Sentinel."""
+    r = _docker("exec", WAL_REDIS_SENTINEL_CTR,
+                "redis-cli", "-p", "26379", "sentinel", "get-master-addr-by-name", "wal-master")
     return r.stdout.strip().split('\n')[0]
 
 def orch_redis_cmd(*args) -> str:
-    """Run a redis-cli command against the current orch-redis master (Sentinel-aware)."""
-    master_ip = _orch_master_ip()
-    r = _docker("exec", ORCH_REDIS_SENTINEL_CTR,
+    """Run a redis-cli command against the current wal-redis master (Sentinel-aware)."""
+    master_ip = _wal_master_ip()
+    r = _docker("exec", WAL_REDIS_SENTINEL_CTR,
                 "redis-cli", "-h", master_ip, "-p", "6379", "-a", "redis", *args)
     return r.stdout.strip()
 
 
 def orch_pending_count() -> int:
-    out = orch_redis_cmd("SCARD", "orch:pending")
+    out = orch_redis_cmd("SCARD", "wal:orch:pending")
     try:
         return int(out)
     except ValueError:
@@ -415,7 +415,7 @@ class TestOrchestratorResilience(unittest.TestCase):
         time.sleep(1)
 
     def test_wal_empty_after_successful_checkout(self):
-        """orch:pending must be empty after a successful checkout completes."""
+        """wal:orch:pending must be empty after a successful checkout completes."""
         order_id, _, _ = make_shippable_order(price=10, stock=5, credit=50)
         r = checkout(order_id)
         self.assertTrue(ok(r), r.text)
@@ -423,7 +423,7 @@ class TestOrchestratorResilience(unittest.TestCase):
         # Give orchestrator a moment to clean up
         time.sleep(1)
         count = orch_pending_count()
-        self.assertEqual(count, 0, f"orch:pending should be empty, has {count} entries")
+        self.assertEqual(count, 0, f"wal:orch:pending should be empty, has {count} entries")
 
     def test_orchestrator_pause_resume_saga(self):
         """
@@ -477,7 +477,7 @@ class TestOrchestratorResilience(unittest.TestCase):
 
     def test_orchestrator_restart_clears_wal(self):
         """
-        Seed orch:pending with a fake completed batch (status=COMPLETED),
+        Seed wal:orch:pending with a fake completed batch (status=COMPLETED),
         restart the orchestrator, and verify it cleans up the stale WAL entry.
         This tests the 'already terminal → just srem' recovery path.
         """
@@ -490,8 +490,8 @@ class TestOrchestratorResilience(unittest.TestCase):
         })
 
         # Seed WAL directly
-        orch_redis_cmd("SADD", "orch:pending", fake_batch_id)
-        orch_redis_cmd("SET", f"orch:batch:{fake_batch_id}", fake_blob)
+        orch_redis_cmd("SADD", "wal:orch:pending", fake_batch_id)
+        orch_redis_cmd("SET", f"wal:orch:batch:{fake_batch_id}", fake_blob)
 
         self.assertEqual(orch_pending_count(), 1, "WAL seed failed")
 
@@ -500,11 +500,11 @@ class TestOrchestratorResilience(unittest.TestCase):
         time.sleep(1)  # let it start
 
         cleared = wait_for_orch_pending_empty(timeout=15)
-        self.assertTrue(cleared, "Orchestrator recovery did not clear completed batch from orch:pending")
+        self.assertTrue(cleared, "Orchestrator recovery did not clear completed batch from wal:orch:pending")
 
     def test_orchestrator_restart_reprocesses_pending_batch(self):
         """
-        Seed orch:pending with a RUNNING batch whose task is PENDING (not yet dispatched).
+        Seed wal:orch:pending with a RUNNING batch whose task is PENDING (not yet dispatched).
         Restart the orchestrator.  Recovery must dispatch the task and push a reply.
 
         This simulates: orchestrator crashed after writing WAL but before dispatching.
@@ -539,8 +539,8 @@ class TestOrchestratorResilience(unittest.TestCase):
             },
         })
 
-        orch_redis_cmd("SADD", "orch:pending", batch_id)
-        orch_redis_cmd("SET", f"orch:batch:{batch_id}", batch_blob)
+        orch_redis_cmd("SADD", "wal:orch:pending", batch_id)
+        orch_redis_cmd("SET", f"wal:orch:batch:{batch_id}", batch_blob)
 
         stock_before = find_item(item_id)["stock"]
 
@@ -577,7 +577,7 @@ class TestOrchestratorResilience(unittest.TestCase):
 
         self.assertEqual(find_item(item_id)["stock"],  final_stock,  "Stock changed after restart")
         self.assertEqual(find_user(user_id)["credit"], final_credit, "Credit changed after restart")
-        self.assertEqual(orch_pending_count(), 0, "orch:pending not empty after restarts")
+        self.assertEqual(orch_pending_count(), 0, "wal:orch:pending not empty after restarts")
 
 
 if __name__ == '__main__':

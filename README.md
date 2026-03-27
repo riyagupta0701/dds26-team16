@@ -49,7 +49,7 @@ A fault-tolerant, distributed e-commerce backend built with Flask microservices,
               └─────────────────────────┘
 ```
 
-The system is composed of three logical services (Order, Stock, Payment) and an **Orchestrator** that coordinates multi-service transactions. Each service runs as **2 application replicas** behind a shared Nginx upstream pool. For data persistence and high availability, each service — including the orchestrator — has its own isolated **Redis master + replica + Sentinel** cluster. The complete stack totals 22 containers.
+The system is composed of three logical services (Order, Stock, Payment) and an **Orchestrator** that coordinates multi-service transactions. Each service runs as **2 application replicas** behind a shared Nginx upstream pool. For data persistence and high availability, each service — including the orchestrator — has its own isolated **Redis master + replica + Sentinel** cluster. A shared **WAL Redis** cluster (master + replica + Sentinel) stores all Write-Ahead Log entries independently of every service's business data. The complete stack totals **22 containers**.
 
 ### Redis Architecture: State vs. Messaging
 
@@ -64,12 +64,12 @@ These connections are configured via separate environment variables to allow spl
 
 The **Orchestrator** is a standalone service (2 replicas) that executes multi-step transaction workflows on behalf of the Order service. When the Order service initiates a checkout, it submits a **batch** of tasks to the orchestrator via the `events:orchestrator` Redis Stream. The orchestrator:
 
-1.  **Persists the batch to a WAL** (`orch:pending` set + `orch:batch:{id}` key) in its own Sentinel-backed Redis cluster before processing.
+1.  **Persists the batch to a WAL** (`wal:orch:pending` set + `wal:orch:batch:{id}` key) in the shared `wal-redis` cluster before processing.
 2.  **Dispatches tasks** to participant streams (`events:stock`, `events:payment`) respecting dependency ordering.
 3.  **Collects replies** via temporary `BLPOP` keys and retries failed deliveries (configurable via `ORCH_MAX_RETRIES`).
 4.  **Pushes the final result** back to the Order service's `reply_to` key and cleans up the WAL.
 
-On startup, each orchestrator replica runs a **recovery sweep**: it scans `orch:pending`, acquires distributed locks to prevent duplicate processing, and re-drives any incomplete batches. This ensures crash recovery even if the orchestrator dies mid-transaction.
+On startup, each orchestrator replica runs a **recovery sweep**: it scans `wal:orch:pending` in `wal-redis`, acquires distributed locks (`wal:orch:lock:{batch_id}`) to prevent duplicate processing, and re-drives any incomplete batches. This ensures crash recovery even if the orchestrator dies mid-transaction.
 
 ## Service Interaction: RPC over Streams
 
@@ -101,8 +101,30 @@ A critical challenge in distributed systems is message reordering or retries. If
 *   When a rollback arrives for an unknown transaction, the service records a "Tombstone" (e.g., `TX_ROLLED_BACK`).
 *   If the original request arrives later, the service sees the Tombstone and ignores the request.
 
+### Decoupled Write-Ahead Log (WAL)
+
+Every WAL entry in the system lives in a **dedicated `wal-redis` cluster** that is completely separate from each service's business-data Redis. This is the core persistence guarantee:
+
+| What | Where stored | Key namespace |
+|------|-------------|---------------|
+| Saga in-flight orders | `wal-redis` | `wal:order:saga:pending` (Set) |
+| 2PC coordinator in-flight | `wal-redis` | `wal:order:2pc:pending` (Set) |
+| Saga tx-id per attempt | `wal-redis` | `wal:order:saga:tx:{order_id}` |
+| Stock 2PC state machine | `wal-redis` | `wal:stock:2pc:{order_id}` |
+| Payment 2PC state machine | `wal-redis` | `wal:payment:2pc:{order_id}:{user_id}` |
+| Orchestrator batch state | `wal-redis` | `wal:orch:batch:{batch_id}` (JSON) |
+| Orchestrator in-flight set | `wal-redis` | `wal:orch:pending` (Set) |
+| Orchestrator recovery locks | `wal-redis` | `wal:orch:lock:{batch_id}` (TTL key) |
+
+**Why this matters:** if `order-redis`, `stock-redis`, or `payment-redis` is wiped or corrupted, the WAL is untouched. On restart, the service reads its business data (which may be partially restored via AOF/replica) and reads the WAL from `wal-redis` to determine which transactions need to be committed or rolled back. The two stores are never written in the same pipeline or transaction.
+
+**Separation rule enforced in code:** every service has a `wal.py` module that opens an independent Redis connection to `wal-redis`. Business writes go to `db` (business Redis); WAL writes go to `wal` (WAL Redis). These are never mixed in the same `WATCH/MULTI/EXEC` pipeline.
+
+**`--appendfsync always`:** `wal-redis` is configured with `appendfsync always` (fsync on every write) rather than `everysec`. This guarantees zero WAL data loss even on a hard crash, at the cost of slightly higher latency on WAL writes.
+
 ### Background Recovery
-On startup, each `order-service` replica scans its WAL (`2pc:pending` or `saga:pending`). If it finds transactions that were in-flight during a crash, it deterministically re-drives them to completion (either committing or rolling back). Similarly, each **orchestrator** replica runs a recovery sweep on startup, scanning `orch:pending` and re-dispatching any incomplete task batches using distributed locks to prevent duplicate processing across replicas.
+
+On startup, each `order-service` replica scans its WAL (`wal:order:saga:pending` or `wal:order:2pc:pending`) in `wal-redis`. If it finds transactions that were in-flight during a crash, it deterministically re-drives them. Each **orchestrator** replica scans `wal:orch:pending` in the same `wal-redis`, acquires distributed locks (`wal:orch:lock:{batch_id}`) to prevent duplicate processing, and re-dispatches any incomplete batches. All participant services are idempotent, so re-driving a batch that was partially completed is safe.
 
 ### Application Replica Failure
 Nginx upstream pools are configured with `max_fails=1 fail_timeout=5s` and `proxy_next_upstream error timeout http_500 http_502 http_503`. When one replica crashes, Nginx automatically retries the request on the healthy one. All containers use `restart: unless-stopped`.
@@ -179,14 +201,19 @@ Configuration is managed via environment variables in `docker-compose.yml` or K8
 | `REDIS_PASSWORD`| all | Redis auth password | `redis` |
 | `REDIS_SENTINEL_HOSTS` | all | Comma-separated `host:port` list of Sentinel nodes | *(optional)* |
 | `REDIS_MASTER_NAME` | all | Sentinel master set name | `mymaster` |
+| `WAL_REDIS_HOST` | order, stock, payment | Decoupled WAL Redis hostname (fallback) | `wal-redis-master` |
+| `WAL_REDIS_PORT` | order, stock, payment | WAL Redis port | `6379` |
+| `WAL_REDIS_PASSWORD` | order, stock, payment | WAL Redis auth password | `redis` |
+| `WAL_REDIS_DB` | order, stock, payment | WAL Redis database index | `0` |
+| `WAL_SENTINEL_HOSTS` | order, stock, payment | WAL Sentinel `host:port` nodes | `wal-redis-sentinel:26379` |
+| `WAL_MASTER_NAME` | order, stock, payment | WAL Sentinel master set name | `wal-master` |
 | `MQ_REDIS_HOST` | all | Host for the MQ connection (Redis Streams) | *(required)* |
 | `MQ_REDIS_PORT` | all | Port for the MQ connection | `6379` |
 | `MQ_REDIS_PASSWORD`| all | Password for the MQ connection | `redis` |
 | `MQ_REDIS_DB` | all | DB index for the MQ connection | `0` |
-| `ORCH_SENTINEL_HOSTS` | orchestrator | Sentinel `host:port` for orchestrator WAL Redis | *(optional)* |
-| `ORCH_MASTER_NAME` | orchestrator | Sentinel master set name for orchestrator Redis | `orch-master` |
-| `ORCH_REDIS_HOST` | orchestrator | Direct Redis host (fallback when Sentinel is not used) | *(optional)* |
-| `ORCH_REDIS_PASSWORD` | orchestrator | Orchestrator Redis auth password | `redis` |
+| `ORCH_MAX_RETRIES` | orchestrator | Max task dispatch retries per attempt | `3` |
+| `ORCH_TASK_TIMEOUT_S` | orchestrator | Per-attempt reply timeout in seconds | `5` |
+| `ORCH_CONSUMER_NAME` | orchestrator | Unique consumer name per replica | `orchestrator-1` |
 | `ORCH_MAX_RETRIES` | orchestrator | Max retry attempts per task delivery | `3` |
 | `ORCH_TASK_TIMEOUT_S` | orchestrator | Timeout (seconds) waiting for a task reply | `5` |
 
@@ -207,6 +234,7 @@ Configuration is managed via environment variables in `docker-compose.yml` or K8
 | `11_native_mq_2pc.sh` | Tests 2PC participant protocol directly over MQ (prepare, commit, abort). |
 | `12_orchestrator.sh` | Orchestrator integration tests: saga/2PC flows, concurrency, pause/resume, WAL recovery. |
 | `13_microservices_pytest.sh` | Python integration tests for stock, payment, and order service correctness. |
+| `14_wal_decoupled.sh` | Verifies WAL keys live only in `wal-redis` for all services and orchestrator; confirms WAL survives killing business-data Redis and both orchestrator containers. |
 
 ## Technology Stack
 

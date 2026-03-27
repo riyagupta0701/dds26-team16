@@ -6,6 +6,12 @@ import threading
 
 import redis
 
+from wal import (
+    wal, persist_batch, load_batch, complete_batch,
+    acquire_lock, release_lock, pending_batch_ids, remove_from_pending,
+    PENDING_KEY,
+)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -15,20 +21,12 @@ MQ_REDIS_PORT     = int(os.environ['MQ_REDIS_PORT'])
 MQ_REDIS_PASSWORD = os.environ['MQ_REDIS_PASSWORD']
 MQ_REDIS_DB       = int(os.environ['MQ_REDIS_DB'])
 
-ORCH_REDIS_HOST     = os.environ.get('ORCH_REDIS_HOST', '')
-ORCH_REDIS_PORT     = int(os.environ.get('ORCH_REDIS_PORT', '6379'))
-ORCH_REDIS_PASSWORD = os.environ.get('ORCH_REDIS_PASSWORD', '')
-ORCH_REDIS_DB       = int(os.environ.get('ORCH_REDIS_DB', '0'))
-ORCH_SENTINEL_HOSTS = os.environ.get('ORCH_SENTINEL_HOSTS', '')
-ORCH_MASTER_NAME    = os.environ.get('ORCH_MASTER_NAME', 'orch-master')
-
 MAX_RETRIES    = int(os.environ.get('ORCH_MAX_RETRIES', '3'))
 TASK_TIMEOUT_S = int(os.environ.get('ORCH_TASK_TIMEOUT_S', '5'))
 
 ORCH_STREAM   = 'events:orchestrator'
 ORCH_GROUP    = 'orchestrator_group'
-ORCH_CONSUMER = 'orchestrator-1'
-PENDING_KEY   = 'orch:pending'
+ORCH_CONSUMER = os.environ.get('ORCH_CONSUMER_NAME', 'orchestrator-1')
 
 # Task states
 S_PENDING         = 'PENDING'
@@ -46,54 +44,18 @@ B_RUNNING   = 'RUNNING'
 B_COMPLETED = 'COMPLETED'
 B_FAILED    = 'FAILED'
 
-# ── Redis connections ──────────────────────────────────────────────────────────
+# ── MQ connection (transient — not the WAL store) ──────────────────────────────
 mq: redis.Redis = redis.Redis(
     host=MQ_REDIS_HOST, port=MQ_REDIS_PORT,
     password=MQ_REDIS_PASSWORD, db=MQ_REDIS_DB,
 )
-
-if ORCH_SENTINEL_HOSTS:
-    from redis.sentinel import Sentinel as _Sentinel
-    from redis.retry import Retry
-    from redis.backoff import NoBackoff
-    _orch_peers = [(h.split(':')[0], int(h.split(':')[1])) for h in ORCH_SENTINEL_HOSTS.split(',')]
-    orch: redis.Redis = _Sentinel(
-        _orch_peers,
-        password=ORCH_REDIS_PASSWORD,
-        db=ORCH_REDIS_DB,
-        socket_timeout=1.5,
-        socket_connect_timeout=1.5,
-    ).master_for(
-        ORCH_MASTER_NAME,
-        socket_timeout=1.5,
-        socket_connect_timeout=1.5,
-        retry=Retry(NoBackoff(), 3),
-        retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError,
-                        redis.exceptions.ReadOnlyError],
-    )
-else:
-    orch: redis.Redis = redis.Redis(
-        host=ORCH_REDIS_HOST, port=ORCH_REDIS_PORT,
-        password=ORCH_REDIS_PASSWORD, db=ORCH_REDIS_DB,
-    )
-
-# ── WAL helpers ────────────────────────────────────────────────────────────────
-def _wal_key(batch_id: str) -> str:
-    return f'orch:batch:{batch_id}'
-
-def _persist_batch(batch: dict):
-    orch.set(_wal_key(batch['batch_id']), json.dumps(batch))
-
-def _load_batch(batch_id: str) -> dict | None:
-    raw = orch.get(_wal_key(batch_id))
-    return json.loads(raw) if raw else None
 
 # ── Task dispatch ──────────────────────────────────────────────────────────────
 def dispatch_task(task: dict) -> dict:
     """
     Send one task to its target stream and block on a per-attempt reply key.
     Retries up to MAX_RETRIES times on timeout only.
-    Any response (200 or non-200) is final — no retry.
+    Any response (200 or non-200) is final — no retry on error responses.
     Returns updated task dict with final state.
     """
     task_id = task['task_id']
@@ -112,23 +74,25 @@ def dispatch_task(task: dict) -> dict:
                 val = json.loads(resp[1])
                 status_code = val.get('status_code', 500)
                 state = S_DELIVERED_OK if status_code == 200 else S_DELIVERED_ERR
-                logger.info(f'Task {task_id} attempt {attempt}: {state} (code={status_code})')
+                logger.info('Task %s attempt %d: %s (code=%s)', task_id, attempt, state, status_code)
                 return {**task, 'state': state, 'status_code': status_code,
                         'body': val.get('body'), 'error': val.get('error')}
             else:
-                logger.warning(f'Task {task_id} attempt {attempt} timed out, retrying')
-        except Exception as e:
-            logger.error(f'Task {task_id} attempt {attempt} exception: {e}')
+                logger.warning('Task %s attempt %d timed out, retrying', task_id, attempt)
+        except Exception as exc:
+            logger.error('Task %s attempt %d exception: %s', task_id, attempt, exc)
 
-    logger.error(f'Task {task_id} DELIVERY_FAILED after {MAX_RETRIES} attempts')
+    logger.error('Task %s DELIVERY_FAILED after %d attempts', task_id, MAX_RETRIES)
     return {**task, 'state': S_DELIVERY_FAILED, 'status_code': None, 'body': None,
             'error': f'No response after {MAX_RETRIES} attempts'}
+
 
 # ── Batch processor ────────────────────────────────────────────────────────────
 def _all_terminal(tasks_by_id: dict) -> bool:
     return all(t['state'] in TERMINAL_STATES for t in tasks_by_id.values())
 
-def _cascade_skipped(tasks_by_id: dict):
+
+def _cascade_skipped(tasks_by_id: dict) -> None:
     """Propagate SKIPPED to tasks whose dependency ended in a failure state."""
     changed = True
     while changed:
@@ -140,14 +104,26 @@ def _cascade_skipped(tasks_by_id: dict):
                 dep = tasks_by_id.get(dep_id)
                 if dep and dep['state'] in FAILURE_STATES:
                     task['state'] = S_SKIPPED
-                    logger.info(f'Task {task["task_id"]} SKIPPED (dep {dep_id} → {dep["state"]})')
+                    logger.info('Task %s SKIPPED (dep %s → %s)',
+                                task['task_id'], dep_id, dep['state'])
                     changed = True
                     break
 
-def process_batch(batch: dict):
+
+def process_batch(batch: dict) -> None:
     """
-    Wave-based dependency executor.  Runs in its own daemon thread per batch.
-    Persists state to WAL after every wave so recovery can resume mid-flight.
+    Wave-based dependency executor. Runs in its own daemon thread per batch.
+
+    WAL contract (all writes go to wal-redis via wal.py):
+      1. persist_batch() is called with status=IN_PROGRESS BEFORE dispatching
+         each wave, so a crash during dispatch leaves the WAL in a state that
+         recovery can re-drive (tasks reset from IN_PROGRESS → PENDING).
+      2. persist_batch() is called again AFTER each wave with the results.
+      3. complete_batch() is called on final success or failure; it updates the
+         JSON snapshot and removes the batch from wal:orch:pending.
+
+    The MQ reply (rpush to reply_to) happens AFTER the WAL write, so the caller
+    (order service) only gets a result once the WAL is settled.
     """
     batch_id = batch['batch_id']
     reply_to = batch['reply_to']
@@ -159,7 +135,7 @@ def process_batch(batch: dict):
     else:
         tasks_by_id = {k: dict(v) for k, v in raw_tasks.items()}
 
-    logger.info(f'process_batch {batch_id}: {len(tasks_by_id)} task(s)')
+    logger.info('process_batch %s: %d task(s)', batch_id, len(tasks_by_id))
 
     while not _all_terminal(tasks_by_id):
         _cascade_skipped(tasks_by_id)
@@ -177,20 +153,31 @@ def process_batch(batch: dict):
         ]
 
         if not ready:
-            logger.error(f'process_batch {batch_id}: no progress possible, marking remaining DELIVERY_FAILED')
+            logger.error('process_batch %s: no progress possible, marking remaining DELIVERY_FAILED', batch_id)
             for t in tasks_by_id.values():
                 if t['state'] == S_PENDING:
                     t['state'] = S_DELIVERY_FAILED
                     t['error'] = 'Deadlock: no progress possible'
             break
 
-        # Mark IN_PROGRESS and persist WAL before dispatching
+        # ── Pre-wave WAL write ─────────────────────────────────────────────────
+        # Mark tasks IN_PROGRESS and persist to WAL *before* dispatching.
+        # If we crash during dispatch, recovery sees IN_PROGRESS and resets to PENDING.
         for t in ready:
             tasks_by_id[t['task_id']]['state'] = S_IN_PROGRESS
         batch['tasks'] = tasks_by_id
-        _persist_batch(batch)
+        try:
+            persist_batch(batch)
+        except redis.exceptions.RedisError:
+            logger.error('process_batch %s: cannot write pre-wave WAL, aborting batch', batch_id)
+            # Cannot proceed safely without a WAL entry — mark failed and exit.
+            for t in tasks_by_id.values():
+                if t['state'] == S_IN_PROGRESS:
+                    t['state'] = S_DELIVERY_FAILED
+                    t['error'] = 'WAL write failed before dispatch'
+            break
 
-        # Dispatch ready tasks concurrently
+        # ── Dispatch ready tasks concurrently ─────────────────────────────────
         results: list[dict] = []
         lock = threading.Lock()
 
@@ -210,105 +197,132 @@ def process_batch(batch: dict):
             tasks_by_id[r['task_id']] = r
         _cascade_skipped(tasks_by_id)
 
-        # Persist WAL after wave
+        # ── Post-wave WAL write ────────────────────────────────────────────────
         batch['tasks'] = tasks_by_id
-        _persist_batch(batch)
+        try:
+            persist_batch(batch)
+        except redis.exceptions.RedisError:
+            logger.error('process_batch %s: cannot write post-wave WAL (continuing)', batch_id)
 
-    # Compute final batch status
+    # ── Finalise ───────────────────────────────────────────────────────────────
     has_delivery_failed = any(t['state'] == S_DELIVERY_FAILED for t in tasks_by_id.values())
     batch_status = B_FAILED if has_delivery_failed else B_COMPLETED
     batch['status'] = batch_status
+    batch['tasks']  = tasks_by_id
 
-    # Build result payload (omit internal payload field)
     result_tasks = {
         tid: {
-            'state': t['state'],
+            'state':       t['state'],
             'status_code': t.get('status_code'),
-            'body': t.get('body'),
-            'error': t.get('error'),
+            'body':        t.get('body'),
+            'error':       t.get('error'),
         }
         for tid, t in tasks_by_id.items()
     }
     reply_payload = json.dumps({
         'batch_id': batch_id,
-        'status': batch_status,
-        'tasks': result_tasks,
+        'status':   batch_status,
+        'tasks':    result_tasks,
     })
 
     try:
+        # Write final WAL state (removes from pending) before replying to caller.
+        complete_batch(batch)
         mq.rpush(reply_to, reply_payload)
         mq.expire(reply_to, 120)
-        orch.srem(PENDING_KEY, batch_id)
-        batch['tasks'] = tasks_by_id
-        _persist_batch(batch)
-    except Exception as e:
-        logger.error(f'process_batch {batch_id}: failed to push reply or clean WAL: {e}')
+    except Exception as exc:
+        logger.error('process_batch %s: failed to complete WAL or push reply: %s', batch_id, exc)
+        # Best-effort: try pushing the reply even if WAL cleanup failed.
+        # wal:orch:pending still holds the batch_id; recovery will re-drive
+        # (idempotent) and clean up on next startup.
+        try:
+            mq.rpush(reply_to, reply_payload)
+            mq.expire(reply_to, 120)
+        except Exception:
+            pass
 
-    logger.info(f'process_batch {batch_id}: {batch_status}')
+    logger.info('process_batch %s: %s', batch_id, batch_status)
+
 
 # ── Recovery ───────────────────────────────────────────────────────────────────
-def recover_batches():
-    time.sleep(5)
-    try:
-        pending = orch.smembers(PENDING_KEY)
-    except Exception as e:
-        logger.error(f'Recovery: cannot read pending set: {e}')
-        return
+def recover_batches() -> None:
+    """
+    Startup recovery sweep. Reads wal:orch:pending from wal-redis and
+    re-dispatches any batch that was in-flight when a previous instance crashed.
 
-    if not pending:
+    Uses distributed locks (wal:orch:lock:{batch_id}) so two orchestrator
+    replicas racing at startup do not both re-drive the same batch.
+
+    Participant services are all idempotent (tombstone / WAL state machine),
+    so re-driving a batch that was partially completed is safe.
+    """
+    time.sleep(5)  # give other services time to come up first
+
+    batch_ids = pending_batch_ids()
+    if not batch_ids:
         logger.info('Recovery: no in-flight batches')
         return
 
-    logger.info(f'Recovery: found {len(pending)} in-flight batch(es)')
+    logger.info('Recovery: found %d in-flight batch(es)', len(batch_ids))
 
-    for batch_id_bytes in pending:
-        batch_id = batch_id_bytes.decode()
-        lock_key = f'orch:lock:{batch_id}'
-        if not orch.set(lock_key, 'locked', nx=True, ex=30):
-            continue  # another instance claimed this batch
+    for batch_id in batch_ids:
+        if not acquire_lock(batch_id):
+            logger.info('Recovery: batch %s claimed by another instance, skipping', batch_id)
+            continue
 
         try:
-            batch = _load_batch(batch_id)
+            batch = load_batch(batch_id)
             if not batch:
-                logger.warning(f'Recovery: batch {batch_id} not found in WAL, removing from pending')
-                orch.srem(PENDING_KEY, batch_id)
+                logger.warning('Recovery: batch %s not found in WAL, removing from pending', batch_id)
+                remove_from_pending(batch_id)
                 continue
 
             if batch.get('status') in (B_COMPLETED, B_FAILED):
-                # Terminal but pending set not cleaned — just clean up
-                orch.srem(PENDING_KEY, batch_id)
+                # Terminal but pending set was not cleaned — just clean up.
+                remove_from_pending(batch_id)
                 continue
 
             # Reset any IN_PROGRESS tasks to PENDING so they are re-dispatched.
-            # Participant idempotency (tombstones) prevents double-apply.
+            # Participant idempotency (tombstones / WAL state machines in wal-redis)
+            # prevents double-apply of already-committed tasks.
             tasks = batch.get('tasks', {})
             if isinstance(tasks, dict):
                 for t in tasks.values():
                     if t.get('state') == S_IN_PROGRESS:
                         t['state'] = S_PENDING
-                        logger.info(f'Recovery: reset task {t["task_id"]} to PENDING')
+                        logger.info('Recovery: reset task %s to PENDING', t['task_id'])
                 batch['tasks'] = tasks
 
-            logger.info(f'Recovery: re-dispatching batch {batch_id}')
+            logger.info('Recovery: re-dispatching batch %s', batch_id)
             threading.Thread(target=process_batch, args=(batch,), daemon=True).start()
-        except Exception as e:
-            logger.error(f'Recovery: failed to process batch {batch_id}: {e}')
+
+        except Exception as exc:
+            logger.error('Recovery: failed to process batch %s: %s', batch_id, exc)
         finally:
-            orch.delete(lock_key)
+            release_lock(batch_id)
+
 
 # ── Stream listener ────────────────────────────────────────────────────────────
-def run_listener():
-    # Create consumer group idempotently
+def run_listener() -> None:
+    """
+    Consume messages from events:orchestrator stream.
+    For each submit_batch message:
+      1. Build batch dict with all tasks in PENDING state.
+      2. Write to WAL (persist_batch) and add to wal:orch:pending BEFORE
+         spawning the processing thread. This guarantees the batch is
+         recoverable even if the process crashes between accept and dispatch.
+      3. Spawn a daemon thread to process the batch.
+    """
     try:
         mq.xgroup_create(ORCH_STREAM, ORCH_GROUP, id='0', mkstream=True)
-        logger.info(f'Created consumer group {ORCH_GROUP} on {ORCH_STREAM}')
-    except redis.exceptions.ResponseError as e:
-        if 'BUSYGROUP' in str(e):
-            logger.info(f'Consumer group {ORCH_GROUP} already exists')
+        logger.info('Created consumer group %s on %s', ORCH_GROUP, ORCH_STREAM)
+    except redis.exceptions.ResponseError as exc:
+        if 'BUSYGROUP' in str(exc):
+            logger.info('Consumer group %s already exists', ORCH_GROUP)
         else:
             raise
 
-    logger.info('Orchestrator listener started')
+    logger.info('Orchestrator listener started (consumer=%s)', ORCH_CONSUMER)
 
     while True:
         try:
@@ -325,7 +339,7 @@ def run_listener():
                     try:
                         msg_type = fields.get(b'type', b'').decode()
                         if msg_type != 'submit_batch':
-                            logger.warning(f'Unknown message type: {msg_type} (id={msg_id})')
+                            logger.warning('Unknown message type: %s (id=%s)', msg_type, msg_id)
                             continue
 
                         batch_id = fields[b'batch_id'].decode()
@@ -354,26 +368,37 @@ def run_listener():
                             'tasks': tasks,
                         }
 
-                        _persist_batch(batch)
-                        orch.sadd(PENDING_KEY, batch_id)
+                        # Write WAL entry BEFORE spawning the processing thread.
+                        # If we crash after this write, recovery will find and
+                        # re-drive the batch. If persist_batch fails, we skip
+                        # spawning — the caller will time out and retry.
+                        try:
+                            persist_batch(batch)
+                        except redis.exceptions.RedisError as exc:
+                            logger.error('Cannot write WAL for batch %s: %s — dropping', batch_id, exc)
+                            continue
+
                         threading.Thread(
                             target=process_batch, args=(batch,), daemon=True
                         ).start()
-                        logger.info(f'Accepted batch {batch_id}')
-                    except Exception as e:
-                        logger.error(f'Error processing message {msg_id}: {e}')
+                        logger.info('Accepted batch %s', batch_id)
 
-        except redis.exceptions.ConnectionError as e:
-            logger.error(f'Connection error in listener: {e}')
+                    except Exception as exc:
+                        logger.error('Error processing message %s: %s', msg_id, exc)
+
+        except redis.exceptions.ConnectionError as exc:
+            logger.error('Connection error in listener: %s', exc)
             time.sleep(1)
-        except Exception as e:
-            logger.error(f'Listener error: {e}')
+        except Exception as exc:
+            logger.error('Listener error: %s', exc)
             time.sleep(1)
+
 
 # ── Entry point ────────────────────────────────────────────────────────────────
-def main():
+def main() -> None:
     threading.Thread(target=recover_batches, daemon=True).start()
     run_listener()
+
 
 if __name__ == '__main__':
     main()

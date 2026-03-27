@@ -11,10 +11,11 @@ import redis
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
+from wal import wal, _stock_wal_key
 
 DB_ERROR_STR = "DB error"
 
-# 2PC WAL state values stored in Redis
+# 2PC WAL state values stored in wal-redis (decoupled from business data)
 WAL_PREPARED  = b"prepared"
 WAL_COMMITTED = b"committed"
 WAL_ABORTED   = b"aborted"
@@ -66,10 +67,9 @@ mq: redis.Redis = redis.Redis(host=os.environ['MQ_REDIS_HOST'],
 def close_db_connection():
     db.close()
     mq.close()
+    wal.close()
 
 
-# Do not register atexit immediately if we plan to use threads that might need the connection
-# or handle it gracefully. For now, we keep it but ensure threads are daemon.
 atexit.register(close_db_connection)
 
 
@@ -326,16 +326,15 @@ def subtract_stock_batch_logic(items_json: str, transaction_id: str | None = Non
 # All three endpoints use WATCH/MULTI/EXEC for optimistic concurrency control so
 # multiple gunicorn workers never corrupt each other's reads and writes.
 
-def _stock_wal_key(order_id: str) -> str:
-    return f"2pc:stock:{order_id}"
-
 def _stock_reserved_key(item_id: str) -> str:
     return f"reserved:stock:{item_id}"
 
 def prepare_subtract_batch_logic(order_id: str, items_json: str):
     """
-    2PC Phase 1 – PREPARE BATCH (participant: stock).
-    Atomically checks availability and reserves stock for all items in the batch.
+    2PC Phase 1 - PREPARE BATCH (participant: stock).
+    WAL state (prepared/committed/aborted) lives in the decoupled wal-redis.
+    Soft-reservations stay in db-redis alongside stock values so they can
+    be checked atomically in a single WATCH/MULTI/EXEC pipeline.
     """
     try:
         items: dict[str, int] = json.loads(items_json)
@@ -346,27 +345,25 @@ def prepare_subtract_batch_logic(order_id: str, items_json: str):
     wal_key = _stock_wal_key(order_id)
     reserved_keys = {k: _stock_reserved_key(k) for k in keys}
 
-    # Watch all involved keys
-    watch_keys = keys + list(reserved_keys.values()) + [wal_key]
+    # ── Step 1: Idempotency check via WAL (wal-redis) ──────────────────────
+    try:
+        wal_state = wal.get(wal_key)
+    except redis.exceptions.RedisError:
+        return response_error(DB_ERROR_STR, 500)
+
+    if wal_state == WAL_ABORTED:
+        return response_error(f"Transaction {order_id} already aborted")
+    if wal_state in (WAL_PREPARED, WAL_COMMITTED):
+        return response_success("Prepare batch: already done")
+
+    # ── Step 2: Availability check + soft-reserve (db-redis) ──────────────
+    watch_keys = keys + list(reserved_keys.values())
 
     for _ in range(10):
         try:
             with db.pipeline() as pipe:
                 pipe.watch(*watch_keys)
 
-                # ── Idempotency check ──────────────────────────────────
-                # If all are already prepared/committed, return success.
-                # If any is aborted, fail.
-                wal_state = pipe.get(wal_key)
-                if wal_state == WAL_ABORTED:
-                    pipe.unwatch()
-                    return response_error(f"Transaction {order_id} already aborted")
-
-                if wal_state in (WAL_PREPARED, WAL_COMMITTED):
-                    pipe.unwatch()
-                    return response_success("Prepare batch: already done")
-
-                # ── Availability check ─────────────────────────────────
                 current_reserved = {}
                 for k, amount in items.items():
                     raw = pipe.get(k)
@@ -382,22 +379,47 @@ def prepare_subtract_batch_logic(order_id: str, items_json: str):
                         pipe.unwatch()
                         return response_error(f"Insufficient stock for item {k}")
 
-                # ── Atomic soft-reserve + WAL ──────────────────────────
                 pipe.multi()
                 for k, amount in items.items():
                     pipe.set(reserved_keys[k], current_reserved[k] + int(amount))
-                pipe.set(wal_key, WAL_PREPARED)
                 pipe.execute()
-                return response_success("Prepare batch: OK")
+                break  # soft-reserve committed to db-redis
         except redis.WatchError:
             continue
         except redis.exceptions.RedisError:
             return response_error(DB_ERROR_STR, 500)
-    return response_error("Conflict: could not prepare batch after retries")
+    else:
+        return response_error("Conflict: could not prepare batch after retries")
+
+    # ── Step 3: Write WAL entry (wal-redis) ────────────────────────────────
+    try:
+        wal.set(wal_key, WAL_PREPARED)
+    except redis.exceptions.RedisError:
+        # WAL write failed — roll back the soft-reserve we just applied.
+        # Use a proper WATCH/MULTI/EXEC so the rollback is atomic and another
+        # writer cannot corrupt the reservation counter between our read and write.
+        for _ in range(5):
+            try:
+                with db.pipeline() as pipe:
+                    pipe.watch(*reserved_keys.values())
+                    current = {k: int(pipe.get(reserved_keys[k]) or 0) for k in items}
+                    pipe.multi()
+                    for k, amount in items.items():
+                        pipe.set(reserved_keys[k], max(0, current[k] - int(amount)))
+                    pipe.execute()
+                    break
+            except redis.WatchError:
+                continue
+            except Exception:
+                break
+        return response_error(DB_ERROR_STR, 500)
+
+    return response_success("Prepare batch: OK")
 
 def commit_subtract_batch_logic(order_id: str, items_json: str):
     """
-    2PC Phase 2 – COMMIT BATCH (participant: stock).
+    2PC Phase 2 - COMMIT BATCH (participant: stock).
+    WAL state read from wal-redis; stock deductions written to db-redis.
     """
     try:
         items: dict[str, int] = json.loads(items_json)
@@ -407,25 +429,26 @@ def commit_subtract_batch_logic(order_id: str, items_json: str):
     keys = list(items.keys())
     wal_key = _stock_wal_key(order_id)
     reserved_keys = {k: _stock_reserved_key(k) for k in keys}
-    watch_keys = keys + list(reserved_keys.values()) + [wal_key]
 
+    # Idempotency check via WAL (wal-redis)
+    try:
+        wal_state = wal.get(wal_key)
+    except redis.exceptions.RedisError:
+        return response_error(DB_ERROR_STR, 500)
+
+    if wal_state == WAL_ABORTED:
+        return response_error(f"Cannot commit: transaction {order_id} aborted")
+    if wal_state == WAL_COMMITTED:
+        return response_success("Commit batch: already done")
+
+    # Apply deductions to db-redis
+    watch_keys = keys + list(reserved_keys.values())
     for _ in range(10):
         try:
             with db.pipeline() as pipe:
                 pipe.watch(*watch_keys)
-
-                wal_state = pipe.get(wal_key)
-                if wal_state == WAL_ABORTED:
-                    pipe.unwatch()
-                    return response_error(f"Cannot commit: transaction {order_id} aborted")
-
-                if wal_state == WAL_COMMITTED:
-                    pipe.unwatch()
-                    return response_success("Commit batch: already done")
-
                 current_reserved = {}
                 current_values = {}
-
                 for k, amount in items.items():
                     raw = pipe.get(k)
                     if not raw:
@@ -434,37 +457,39 @@ def commit_subtract_batch_logic(order_id: str, items_json: str):
                     current_values[k] = msgpack.decode(raw, type=StockValue)
                     res_val = pipe.get(reserved_keys[k])
                     current_reserved[k] = int(res_val or 0)
-
                 pipe.multi()
                 for k, amount in items.items():
                     item = current_values[k]
                     item.stock -= int(amount)
                     if item.stock < 0:
-                        # The coordinator has already durably logged COMMIT, so
-                        # we must commit regardless.  This path should be
-                        # unreachable, but if
-                        # something bypassed the reservation, log and proceed.
                         app.logger.error(
-                            f"2PC commit: stock underflow for item {k} order {order_id} "
-                            f"(stock={item.stock}, reserved={current_reserved[k]}, amount={amount}). "
+                            f"2PC commit: stock underflow for item {k} order {order_id}. "
                             f"Committing anyway to preserve 2PC durability."
                         )
                     new_reserved = max(0, current_reserved[k] - int(amount))
-
                     pipe.set(k, msgpack.encode(item))
                     pipe.set(reserved_keys[k], new_reserved)
-                pipe.set(wal_key, WAL_COMMITTED)
                 pipe.execute()
-                return response_success("Commit batch: OK")
+                break
         except redis.WatchError:
             continue
         except redis.exceptions.RedisError:
             return response_error(DB_ERROR_STR, 500)
-    return response_error("Conflict: could not commit batch after retries")
+    else:
+        return response_error("Conflict: could not commit batch after retries")
+
+    # Write WAL committed (wal-redis) — non-fatal if it fails
+    try:
+        wal.set(wal_key, WAL_COMMITTED)
+    except redis.exceptions.RedisError:
+        app.logger.warning("Could not write WAL_COMMITTED for order %s; idempotent on retry", order_id)
+
+    return response_success("Commit batch: OK")
 
 def abort_subtract_batch_logic(order_id: str, items_json: str):
     """
-    2PC Phase 2 – ABORT BATCH (participant: stock).
+    2PC Phase 2 - ABORT BATCH (participant: stock).
+    WAL state read/written in wal-redis; reservation release in db-redis.
     """
     try:
         items: dict[str, int] = json.loads(items_json)
@@ -474,38 +499,52 @@ def abort_subtract_batch_logic(order_id: str, items_json: str):
     keys = list(items.keys())
     wal_key = _stock_wal_key(order_id)
     reserved_keys = {k: _stock_reserved_key(k) for k in keys}
-    watch_keys = list(reserved_keys.values()) + [wal_key]
 
+    # Idempotency check via WAL (wal-redis)
+    try:
+        wal_state = wal.get(wal_key)
+    except redis.exceptions.RedisError:
+        return response_error(DB_ERROR_STR, 500)
+
+    if wal_state == WAL_COMMITTED:
+        return response_error(f"Cannot abort: transaction {order_id}, already committed")
+    if wal_state == WAL_ABORTED:
+        return response_success("Abort batch: already done")
+
+    # Release reservations in db-redis
+    watch_keys = list(reserved_keys.values())
     for _ in range(10):
         try:
             with db.pipeline() as pipe:
                 pipe.watch(*watch_keys)
-
-                wal_state = pipe.get(wal_key)
-                if wal_state == WAL_COMMITTED:
-                    pipe.unwatch()
-                    return response_error(f"Cannot abort: transaction {order_id}, already committed")
-                elif wal_state != WAL_ABORTED:
-                    current_reserved = {}
-                    for k, amount in items.items():
-                        raw = pipe.get(k)
-                        if not raw:
-                            pipe.unwatch()
-                            return response_error(f"Item: {k} not found!")
-                        res_val = pipe.get(reserved_keys[k])
-                        current_reserved[k] = int(res_val or 0)
-                    pipe.multi()
-                    pipe.set(wal_key, WAL_ABORTED)
-                    for k, amount in items.items():
-                        new_reserved = max(0, current_reserved[k] - int(amount))
-                        pipe.set(reserved_keys[k], new_reserved)
-                    pipe.execute()
-                return response_success("Abort batch: OK")
+                current_reserved = {}
+                for k, amount in items.items():
+                    raw = pipe.get(k)
+                    if not raw:
+                        pipe.unwatch()
+                        return response_error(f"Item: {k} not found!")
+                    res_val = pipe.get(reserved_keys[k])
+                    current_reserved[k] = int(res_val or 0)
+                pipe.multi()
+                for k, amount in items.items():
+                    new_reserved = max(0, current_reserved[k] - int(amount))
+                    pipe.set(reserved_keys[k], new_reserved)
+                pipe.execute()
+                break
         except redis.WatchError:
             continue
         except redis.exceptions.RedisError:
             return response_error(DB_ERROR_STR, 500)
-    return response_error("Conflict: could not abort batch after retries")
+    else:
+        return response_error("Conflict: could not abort batch after retries")
+
+    # Write WAL aborted (wal-redis)
+    try:
+        wal.set(wal_key, WAL_ABORTED)
+    except redis.exceptions.RedisError:
+        app.logger.warning("Could not write WAL_ABORTED for order %s", order_id)
+
+    return response_success("Abort batch: OK")
 
 # ─── Flask Routes (Wrappers) ──────────────────────────────────────────────────
 

@@ -10,8 +10,10 @@ STATUS_STARTED = "started"
 STATUS_PAID    = "paid"
 STATUS_FAILED  = "failed"
 
-COORD_PENDING_KEY = "2pc:pending"
-SAGA_PENDING_KEY  = "saga:pending"
+# WAL keys now live in wal-redis (imported from wal.py).
+# These names are kept here as aliases so the rest of the codebase
+# can import them from db without touching their call sites.
+from wal import COORD_PENDING_KEY, SAGA_PENDING_KEY  # noqa: E402
 
 # ── Connections ────────────────────────────────────────────────────────────────
 _REDIS_PASSWORD    = os.environ.get('REDIS_PASSWORD', '')
@@ -72,11 +74,35 @@ def get_order(order_id: str) -> OrderValue:
 def save_order(order_id: str, order: OrderValue, *,
                wal_add: str | None = None,
                wal_remove: str | None = None):
-    """Atomically persist order with an optional WAL set update. Raises RedisError."""
-    with db.pipeline(transaction=True) as pipe:
-        pipe.set(order_id, msgpack.encode(order))
+    """
+    Persist order to business-data Redis with optional WAL set updates.
+
+    WAL-before-act ordering:
+      1. Write WAL entry to wal-redis first (if wal_add is set).
+      2. Write order to db-redis.
+      3. Remove WAL entry from wal-redis (if wal_remove is set, best-effort).
+    """
+    from wal import wal as _wal
+
+    # Step 1: write WAL entry before touching db
+    try:
         if wal_add:
-            pipe.sadd(wal_add, order_id)
-        if wal_remove:
-            pipe.srem(wal_remove, order_id)
-        pipe.execute()
+            _wal.sadd(wal_add, order_id)
+    except redis.exceptions.RedisError:
+        raise  # cannot proceed without a WAL entry
+
+    # Step 2: persist business data
+    try:
+        db.set(order_id, msgpack.encode(order))
+    except redis.exceptions.RedisError:
+        # db write failed — the WAL entry we just added is an orphan.
+        # Recovery will find it, read STATUS_PENDING (unchanged) or a missing
+        # order in db, and clean up safely. Re-raise so the caller aborts.
+        raise
+
+    # Step 3: best-effort WAL cleanup
+    if wal_remove:
+        try:
+            _wal.srem(wal_remove, order_id)
+        except redis.exceptions.RedisError:
+            pass  # non-fatal: recovery will clean up on next startup

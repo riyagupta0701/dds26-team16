@@ -11,9 +11,11 @@ import redis
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
+from wal import wal, _payment_wal_key
+
 DB_ERROR_STR = "DB error"
 
-# 2PC WAL state values stored in Redis
+# 2PC WAL state values stored in wal-redis (decoupled from business data)
 WAL_PREPARED  = b"prepared"
 WAL_COMMITTED = b"committed"
 WAL_ABORTED   = b"aborted"
@@ -65,10 +67,9 @@ mq: redis.Redis = redis.Redis(host=os.environ['MQ_REDIS_HOST'],
 def close_db_connection():
     db.close()
     mq.close()
+    wal.close()
 
 
-# Do not register atexit immediately if we plan to use threads that might need the connection
-# or handle it gracefully. For now, we keep it but ensure threads are daemon.
 atexit.register(close_db_connection)
 
 
@@ -240,179 +241,200 @@ def remove_credit_logic(user_id: str, amount: int, transaction_id: str | None = 
 #
 # All three endpoints use WATCH/MULTI/EXEC for optimistic concurrency control.
 
-def _payment_wal_key(order_id: str, user_id: str) -> str:
-    return f"2pc:payment:{order_id}:{user_id}"
-
-
 def _payment_reserved_key(user_id: str) -> str:
     return f"reserved:payment:{user_id}"
 
 def prepare_pay_logic(order_id: str, user_id: str, amount: int):
     """
-    2PC Phase 1 – PREPARE (participant: payment).
+    2PC Phase 1 - PREPARE (participant: payment).
 
-    Atomically checks that user_id has enough unreserved credit, then
-    soft-reserves `amount` and records a WAL entry so the decision
-    survives participant crashes.
+    WAL state read/written in wal-redis (decoupled).
+    Soft-reservation written in db-redis alongside credit balance so it can
+    be checked atomically in a single WATCH/MULTI/EXEC pipeline.
 
-    Idempotent: a duplicate call for the same (order_id, user_id) returns 200.
+    Order of operations:
+      1. Read WAL from wal-redis — idempotency / abort guard.
+      2. Check availability + soft-reserve in db-redis (WATCH/MULTI/EXEC).
+      3. Write WAL_PREPARED to wal-redis.
+    If step 3 fails, the soft-reserve is rolled back so the state remains clean.
     """
     amount = int(amount)
     wal_key      = _payment_wal_key(order_id, user_id)
     reserved_key = _payment_reserved_key(user_id)
 
+    # Step 1: idempotency check via WAL (wal-redis)
     try:
-        with db.pipeline() as pipe:
-            while True:
-                try:
-                    pipe.watch(user_id, reserved_key, wal_key)
-
-                    # ── Idempotency check ──────────────────────────────────
-                    wal_state = pipe.get(wal_key)
-                    if wal_state in (WAL_PREPARED, WAL_COMMITTED):
-                        pipe.unwatch()
-                        return response_success("Prepare: already done")
-                    if wal_state == WAL_ABORTED:
-                        pipe.unwatch()
-                        return response_error(f"Transaction {order_id} already aborted for user {user_id}")
-
-                    # ── Availability check ─────────────────────────────────
-                    raw = pipe.get(user_id)
-                    if not raw:
-                        pipe.unwatch()
-                        return response_error(f"User: {user_id} not found!")
-                    user      = msgpack.decode(raw, type=UserValue)
-                    reserved  = int(pipe.get(reserved_key) or 0)
-                    available = user.credit - reserved
-
-                    if available < amount:
-                        pipe.unwatch()
-                        return response_error(f"Insufficient credit for user {user_id}: "
-                                   f"available={available}, requested={amount}")
-
-                    # ── Atomic soft-reserve + WAL ──────────────────────────
-                    pipe.multi()
-                    pipe.set(reserved_key, reserved + amount)
-                    pipe.set(wal_key, WAL_PREPARED)
-                    pipe.execute()
-                    break
-
-                except redis.WatchError:
-                    continue  # concurrent writer; retry
-
+        wal_state = wal.get(wal_key)
     except redis.exceptions.RedisError:
         return response_error(DB_ERROR_STR, 500)
 
-    app.logger.debug(f"2PC prepare OK  order={order_id} user={user_id} amount={amount}")
+    if wal_state in (WAL_PREPARED, WAL_COMMITTED):
+        return response_success("Prepare: already done")
+    if wal_state == WAL_ABORTED:
+        return response_error(f"Transaction {order_id} already aborted for user {user_id}")
+
+    # Step 2: availability check + soft-reserve (db-redis only, no WAL key in pipeline)
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(user_id, reserved_key)
+                raw = pipe.get(user_id)
+                if not raw:
+                    pipe.unwatch()
+                    return response_error(f"User: {user_id} not found!")
+                user     = msgpack.decode(raw, type=UserValue)
+                reserved = int(pipe.get(reserved_key) or 0)
+                available = user.credit - reserved
+                if available < amount:
+                    pipe.unwatch()
+                    return response_error(
+                        f"Insufficient credit for user {user_id}: "
+                        f"available={available}, requested={amount}")
+                pipe.multi()
+                pipe.set(reserved_key, reserved + amount)
+                pipe.execute()
+                break
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return response_error(DB_ERROR_STR, 500)
+    else:
+        return response_error("Conflict: could not prepare after retries")
+
+    # Step 3: write WAL entry (wal-redis)
+    try:
+        wal.set(wal_key, WAL_PREPARED)
+    except redis.exceptions.RedisError:
+        # Roll back the soft-reserve we just applied
+        try:
+            for _ in range(5):
+                try:
+                    with db.pipeline() as pipe:
+                        pipe.watch(reserved_key)
+                        cur = int(pipe.get(reserved_key) or 0)
+                        pipe.multi()
+                        pipe.set(reserved_key, max(0, cur - amount))
+                        pipe.execute()
+                        break
+                except redis.WatchError:
+                    continue
+        except Exception:
+            pass
+        return response_error(DB_ERROR_STR, 500)
+
+    app.logger.debug("2PC prepare OK  order=%s user=%s amount=%s", order_id, user_id, amount)
     return response_success("Prepare: OK")
+
 
 def commit_pay_logic(order_id: str, user_id: str, amount: int):
     """
-    2PC Phase 2 – COMMIT (participant: payment).
+    2PC Phase 2 - COMMIT (participant: payment).
 
-    Permanently deducts `amount` from user credit and releases the soft-
-    reservation.  Safe to call multiple times (idempotent via WAL).
+    WAL state read from wal-redis; credit deduction written to db-redis.
+    WAL_COMMITTED written to wal-redis after the db write succeeds.
     """
     amount = int(amount)
     wal_key      = _payment_wal_key(order_id, user_id)
     reserved_key = _payment_reserved_key(user_id)
 
+    # Idempotency / guard via WAL (wal-redis)
     try:
-        with db.pipeline() as pipe:
-            while True:
-                try:
-                    pipe.watch(user_id, reserved_key, wal_key)
-
-                    wal_state = pipe.get(wal_key)
-                    if wal_state == WAL_COMMITTED:
-                        pipe.unwatch()
-                        return response_success("Commit: already done")
-                    if wal_state == WAL_ABORTED:
-                        pipe.unwatch()
-                        return response_error(f"Cannot commit: transaction {order_id} was aborted for user {user_id}")
-
-                    # WAL_PREPARED (or None on coordinator recovery re-drive)
-                    raw = pipe.get(user_id)
-                    if not raw:
-                        pipe.unwatch()
-                        return response_error(f"User: {user_id} not found!")
-                    user      = msgpack.decode(raw, type=UserValue)
-                    reserved  = int(pipe.get(reserved_key) or 0)
-
-                    new_credit   = user.credit - amount
-                    new_reserved = max(0, reserved - amount)
-
-                    if new_credit < 0:
-                        # The coordinator has already durably logged COMMIT, so
-                        # we must commit regardless.  This path should be
-                        # unreachable now that /pay checks reservations, but if
-                        # something bypassed the reservation, log and proceed.
-                        app.logger.error(
-                            f"2PC commit: credit underflow for user {user_id} order {order_id} "
-                            f"(credit={user.credit}, reserved={reserved}, amount={amount}). "
-                            f"Committing anyway to preserve 2PC durability."
-                        )
-
-                    user.credit = new_credit
-
-                    pipe.multi()
-                    pipe.set(user_id, msgpack.encode(user))
-                    pipe.set(reserved_key, new_reserved)
-                    pipe.set(wal_key, WAL_COMMITTED)
-                    pipe.execute()
-                    break
-
-                except redis.WatchError:
-                    continue
-
+        wal_state = wal.get(wal_key)
     except redis.exceptions.RedisError:
         return response_error(DB_ERROR_STR, 500)
 
-    app.logger.debug(f"2PC commit OK   order={order_id} user={user_id} amount={amount}")
+    if wal_state == WAL_COMMITTED:
+        return response_success("Commit: already done")
+    if wal_state == WAL_ABORTED:
+        return response_error(f"Cannot commit: transaction {order_id} was aborted for user {user_id}")
+
+    # Apply deduction to db-redis (WATCH/MULTI/EXEC, no WAL key in pipeline)
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(user_id, reserved_key)
+                raw = pipe.get(user_id)
+                if not raw:
+                    pipe.unwatch()
+                    return response_error(f"User: {user_id} not found!")
+                user     = msgpack.decode(raw, type=UserValue)
+                reserved = int(pipe.get(reserved_key) or 0)
+                new_credit   = user.credit - amount
+                new_reserved = max(0, reserved - amount)
+                if new_credit < 0:
+                    app.logger.error(
+                        "2PC commit: credit underflow for user %s order %s. "
+                        "Committing anyway to preserve 2PC durability.",
+                        user_id, order_id)
+                user.credit = new_credit
+                pipe.multi()
+                pipe.set(user_id, msgpack.encode(user))
+                pipe.set(reserved_key, new_reserved)
+                pipe.execute()
+                break
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return response_error(DB_ERROR_STR, 500)
+    else:
+        return response_error("Conflict: could not commit after retries")
+
+    # Write WAL committed (wal-redis) — non-fatal if it fails
+    try:
+        wal.set(wal_key, WAL_COMMITTED)
+    except redis.exceptions.RedisError:
+        app.logger.warning("Could not write WAL_COMMITTED for order %s user %s; idempotent on retry",
+                           order_id, user_id)
+
+    app.logger.debug("2PC commit OK   order=%s user=%s amount=%s", order_id, user_id, amount)
     return response_success("Commit: OK")
+
 
 def abort_pay_logic(order_id: str, user_id: str, amount: int):
     """
-    2PC Phase 2 – ABORT (participant: payment).
+    2PC Phase 2 - ABORT (participant: payment).
 
-    Releases the soft-reservation without touching actual credit.
-    Safe to call even if prepare was never received (WAL=None → no-op).
-    Idempotent: calling twice returns 200 both times.
+    WAL state read from wal-redis.  If WAL is None or ABORTED → no-op.
+    Reservation release written to db-redis; WAL_ABORTED written to wal-redis.
     """
     amount = int(amount)
     wal_key      = _payment_wal_key(order_id, user_id)
     reserved_key = _payment_reserved_key(user_id)
 
+    # Idempotency / guard via WAL (wal-redis)
     try:
-        with db.pipeline() as pipe:
-            while True:
-                try:
-                    pipe.watch(reserved_key, wal_key)
-
-                    wal_state = pipe.get(wal_key)
-                    if wal_state == WAL_ABORTED or wal_state is None:
-                        # Already aborted or never prepared — nothing to release.
-                        pipe.unwatch()
-                        return response_success("Abort: already done or not prepared")
-                    if wal_state == WAL_COMMITTED:
-                        pipe.unwatch()
-                        return response_error(f"Cannot abort: transaction {order_id} already committed for user {user_id}")
-
-                    # WAL_PREPARED: release the reservation.
-                    reserved     = int(pipe.get(reserved_key) or 0)
-                    new_reserved = max(0, reserved - amount)
-
-                    pipe.multi()
-                    pipe.set(reserved_key, new_reserved)
-                    pipe.set(wal_key, WAL_ABORTED)
-                    pipe.execute()
-                    break
-
-                except redis.WatchError:
-                    continue
-
+        wal_state = wal.get(wal_key)
     except redis.exceptions.RedisError:
         return response_error(DB_ERROR_STR, 500)
+
+    if wal_state == WAL_ABORTED or wal_state is None:
+        return response_success("Abort: already done or not prepared")
+    if wal_state == WAL_COMMITTED:
+        return response_error(f"Cannot abort: transaction {order_id} already committed for user {user_id}")
+
+    # Release reservation in db-redis (no WAL key in pipeline)
+    for _ in range(10):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(reserved_key)
+                reserved     = int(pipe.get(reserved_key) or 0)
+                new_reserved = max(0, reserved - amount)
+                pipe.multi()
+                pipe.set(reserved_key, new_reserved)
+                pipe.execute()
+                break
+        except redis.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return response_error(DB_ERROR_STR, 500)
+    else:
+        return response_error("Conflict: could not abort after retries")
+
+    # Write WAL aborted (wal-redis)
+    try:
+        wal.set(wal_key, WAL_ABORTED)
+    except redis.exceptions.RedisError:
+        app.logger.warning("Could not write WAL_ABORTED for order %s user %s", order_id, user_id)
 
     return response_success("Abort: OK")
 

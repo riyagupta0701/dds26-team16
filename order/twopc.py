@@ -8,6 +8,7 @@ from msgspec import msgpack
 from db import (db, OrderValue, get_order, save_order,
                 STATUS_PAID, STATUS_FAILED, STATUS_STARTED,
                 COORD_PENDING_KEY, DB_ERROR_STR)
+from wal import wal
 from rpc import submit_batch, recovery_rpc, task_ok, task_error
 
 log = logging.getLogger('order-service')
@@ -42,6 +43,19 @@ def _commit_tasks(order_id: str, order: OrderValue) -> list:
 # ── Checkout ───────────────────────────────────────────────────────────────────
 
 def checkout_2pc(order_id: str) -> Response:
+    # ── WAL-before-act ─────────────────────────────────────────────────────────
+    # Write the WAL entry BEFORE committing STATUS_STARTED to db. This is the
+    # critical ordering: if we crash after the WAL write but before db.execute(),
+    # recovery finds the WAL entry, reads STATUS_PENDING (or missing) in db, and
+    # aborts cleanly. The reverse order (db first, WAL second) creates a window
+    # where the order is stuck in STATUS_STARTED with no WAL entry — recovery
+    # never finds it, and the next checkout attempt hits the STATUS_STARTED guard
+    # and returns 400 forever.
+    try:
+        wal.sadd(COORD_PENDING_KEY, order_id)
+    except redis.exceptions.RedisError:
+        abort(500, DB_ERROR_STR)
+
     # WATCH so only one gunicorn worker can claim a STATUS_PENDING order.
     try:
         with db.pipeline() as pipe:
@@ -51,24 +65,32 @@ def checkout_2pc(order_id: str) -> Response:
                     raw = pipe.get(order_id)
                     if not raw:
                         pipe.reset()
+                        wal.srem(COORD_PENDING_KEY, order_id)
                         abort(400, f"Order: {order_id} not found!")
                     order = msgpack.decode(raw, type=OrderValue)
                     if order.status == STATUS_PAID:
                         pipe.reset()
+                        wal.srem(COORD_PENDING_KEY, order_id)
                         return Response("Checkout successful", status=200)
                     if order.status == STATUS_STARTED:
                         pipe.reset()
+                        # WAL entry already existed (prior attempt) — leave it.
                         abort(400, f"Order {order_id} is in state: {order.status}")
                     # STATUS_FAILED orders can be retried (e.g. after adding stock/credit)
                     order.status = STATUS_STARTED
                     pipe.multi()
                     pipe.set(order_id, msgpack.encode(order))
-                    pipe.sadd(COORD_PENDING_KEY, order_id)
                     pipe.execute()
                     break
                 except redis.WatchError:
                     continue
     except redis.exceptions.RedisError:
+        # db claim failed — remove the WAL entry we added above so we don't
+        # leave a ghost entry pointing at an order that never moved to STARTED.
+        try:
+            wal.srem(COORD_PENDING_KEY, order_id)
+        except redis.exceptions.RedisError:
+            pass
         abort(500, DB_ERROR_STR)
 
     # Phase 1: PREPARE (both participants in parallel)
@@ -105,7 +127,7 @@ def checkout_2pc(order_id: str) -> Response:
         payment_ok = task_ok(commit_result, f"{order_id}:2pc:commit:payment")
         if stock_ok and payment_ok:
             try:
-                db.srem(COORD_PENDING_KEY, order_id)
+                wal.srem(COORD_PENDING_KEY, order_id)
             except redis.exceptions.RedisError:
                 log.warning("Could not remove %s from coordinator WAL", order_id)
 
@@ -127,7 +149,7 @@ def abort_2pc(order_id: str, order: OrderValue):
 
     if stock_ok and payment_ok:
         try:
-            db.srem(COORD_PENDING_KEY, order_id)
+            wal.srem(COORD_PENDING_KEY, order_id)
         except redis.exceptions.RedisError:
             log.warning("Could not remove %s from coordinator WAL", order_id)
 
@@ -136,7 +158,7 @@ def abort_2pc(order_id: str, order: OrderValue):
 
 def recover_2pc():
     try:
-        pending = db.smembers(COORD_PENDING_KEY)
+        pending = wal.smembers(COORD_PENDING_KEY)
     except redis.exceptions.RedisError as e:
         log.error("2PC recovery: cannot read WAL: %s", e)
         return
@@ -147,14 +169,14 @@ def recover_2pc():
 
     for raw_id in pending:
         order_id = raw_id.decode()
-        lock_key = f"recovery_lock_2pc:{order_id}"
-        if not db.set(lock_key, "locked", nx=True, ex=30):
+        lock_key = f"wal:order:2pc:recovery_lock:{order_id}"
+        if not wal.set(lock_key, "locked", nx=True, ex=30):
             continue
 
         try:
             raw = db.get(order_id)
             if not raw:
-                db.srem(COORD_PENDING_KEY, order_id)
+                wal.srem(COORD_PENDING_KEY, order_id)
                 continue
 
             order = msgpack.decode(raw, type=OrderValue)
@@ -165,7 +187,7 @@ def recover_2pc():
                 log.info("2PC recovery: re-driving COMMIT for %s", order_id)
                 if (recovery_rpc('events:stock',   'commit_subtract_batch', stock_p) and
                         recovery_rpc('events:payment', 'commit_pay',            payment_p)):
-                    db.srem(COORD_PENDING_KEY, order_id)
+                    wal.srem(COORD_PENDING_KEY, order_id)
             else:
                 log.info("2PC recovery: re-driving ABORT for %s (status=%s)", order_id, order.status)
                 if (recovery_rpc('events:stock',   'abort_subtract_batch', stock_p) and
@@ -176,6 +198,6 @@ def recover_2pc():
         except Exception as e:
             log.error("2PC recovery: error processing %s: %s", order_id, e)
         finally:
-            db.delete(lock_key)
+            wal.delete(lock_key)
 
     log.info("2PC recovery: complete")
