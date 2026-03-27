@@ -43,7 +43,7 @@ A fault-tolerant, distributed e-commerce backend built with Flask microservices,
               └─────────────────────────┘
 ```
 
-The system is composed of three logical services (Order, Stock, Payment). Each service runs as **2 application replicas** behind a shared Nginx upstream pool. For data persistence and high availability, each service has its own isolated **Redis master + replica + Sentinel** cluster. The complete stack totals 19 containers (16 original + 3 Sentinels).
+The system is composed of three logical services (Order, Stock, Payment). Each service runs as one or more application replicas behind a shared Nginx upstream pool — the number of replicas depends on the chosen compose file (1 / 4 / 8 for small / medium / large). For data persistence and high availability, each service has its own isolated **Redis master + replica + Sentinel** cluster.
 
 ### Redis Architecture: State vs. Messaging
 
@@ -108,21 +108,35 @@ All state mutations use Redis `WATCH/MULTI/EXEC` optimistic locking with up to 1
 
 ## Getting Started
 
-### Docker Compose (Local Development)
+### Docker Compose
+
+Three compose files are provided targeting different CPU budgets. All expose the gateway on `http://localhost:8000`.
 
 **Prerequisites:** Docker ≥ 24, Docker Compose v2.
 
-1.  **Start the stack:**
-    ```bash
-    docker compose down -v          # wipe old volumes (clean slate)
-    docker compose up --build       # build images and start all 19 containers
-    ```
-    The gateway is available at `http://localhost:8000` once all services report healthy (~10–15 seconds).
+#### Small — single instance (~5 CPUs)
+One replica and one gunicorn worker per service.
 
-2.  **Run tests:**
-    ```bash
-    bash test-scripts/run_all.sh
-    ```
+```bash
+docker compose -f docker-compose-small.yml down -v
+docker compose -f docker-compose-small.yml up --build
+```
+
+#### Medium — ~50 CPUs
+Four replicas per service, each capped at 3.8 CPUs (total hard limit: 49.8 CPUs).
+
+```bash
+docker compose -f docker-compose-medium.yml down -v
+docker compose -f docker-compose-medium.yml up --build
+```
+
+#### Large — ~90 CPUs
+Eight replicas per service, each capped at 3.4 CPUs (total hard limit: 89.4 CPUs). Designed for 96-core machine, leaving ~6 CPUs for locust clients.
+
+```bash
+docker compose -f docker-compose-large.yml down -v
+docker compose -f docker-compose-large.yml up --build
+```
 
 ### Kubernetes — minikube (Local)
 
