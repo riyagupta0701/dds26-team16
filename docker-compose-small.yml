@@ -1,0 +1,187 @@
+## Small cluster: single instance, 1 replica per service, 1 gunicorn worker each.
+## Per the assignment: "single instance, with a single worker on each service and database/etc."
+## No replicas, no sentinels — one Redis container per service.
+##
+## CPU accounting (rough, no hard limits):
+##   mq-redis:              0.2
+##   gateway (nginx):       0.1
+##   order-service:         ~1 CPU
+##   stock-service:         ~1 CPU
+##   payment-service:       ~1 CPU
+##   orchestrator:          ~1 CPU
+##   order-redis:           0.2
+##   stock-redis:           0.2
+##   payment-redis:         0.2
+##   orch-redis:            0.2
+##   ──────────────────────────
+##   Total ≈ 5 CPUs
+
+services:
+  # ── MESSAGE QUEUE BROKER ──────────────────────────────────────────────────
+  mq-redis:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "256mb"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── GATEWAY ───────────────────────────────────────────────────────────────
+  gateway:
+    image: nginx:1.25-bookworm
+    volumes:
+      - ./gateway_nginx_small.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8000:80"
+    depends_on:
+      - order-service
+      - stock-service
+      - payment-service
+    restart: unless-stopped
+
+  # ── ORCHESTRATOR (1 replica, standalone Redis) ────────────────────────────
+  orchestrator:
+    build: ./orchestrator
+    image: orchestrator
+    environment:
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
+      - ORCH_REDIS_PASSWORD=redis
+      - ORCH_REDIS_DB=0
+      - ORCH_REDIS_HOST=orch-redis
+      - ORCH_REDIS_PORT=6379
+      - ORCH_MAX_RETRIES=3
+      - ORCH_TASK_TIMEOUT_S=5
+    depends_on:
+      mq-redis:
+        condition: service_healthy
+      orch-redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  orch-redis:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "256mb",
+              "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - orch-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── ORDER SERVICE (1 replica, 1 worker) ──────────────────────────────────
+  order-service:
+    build: ./order
+    image: order:latest
+    environment:
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
+      - GATEWAY_URL=http://gateway:80
+      - CHECKOUT_MODE=saga
+      - REDIS_HOST=order-redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+    command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 70 --log-level=info app:app
+    depends_on:
+      mq-redis:
+        condition: service_healthy
+      order-redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  order-redis:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis",
+              "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - order-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── STOCK SERVICE (1 replica, 1 worker) ──────────────────────────────────
+  stock-service:
+    build: ./stock
+    image: stock:latest
+    environment:
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
+      - REDIS_HOST=stock-redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+    command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
+    depends_on:
+      mq-redis:
+        condition: service_healthy
+      stock-redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  stock-redis:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis",
+              "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - stock-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── PAYMENT SERVICE (1 replica, 1 worker) ────────────────────────────────
+  payment-service:
+    build: ./payment
+    image: user:latest
+    environment:
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
+      - REDIS_HOST=payment-redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+    command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
+    depends_on:
+      mq-redis:
+        condition: service_healthy
+      payment-redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  payment-redis:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis",
+              "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - payment-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  order-data:
+  stock-data:
+  payment-data:
+  orch-data:

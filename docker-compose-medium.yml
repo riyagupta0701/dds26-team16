@@ -1,0 +1,468 @@
+## Medium cluster: hard limit of exactly 50 CPUs total.
+##
+## CPU accounting (hard limits, exact sum):
+##   mq-redis:                          0.5
+##   gateway (nginx):                   1.0
+##   orchestrator        ×2 (1.4 each): 2.8
+##   orch-redis-master:                 0.5
+##   orch-redis-replica:                0.3
+##   orch-redis-sentinel:               0.1
+##   order-service       ×4 (3.5 each): 14.0
+##   stock-service       ×4 (3.5 each): 14.0
+##   payment-service     ×4 (3.5 each): 14.0
+##   3× redis masters    (0.5 each):    1.5
+##   3× redis replicas   (0.3 each):    0.9
+##   3× redis sentinels  (0.1 each):    0.3
+##   ────────────────────────────────────────
+##   Total = 49.9 CPUs  (hard limit ≤ 50)
+
+services:
+  # ── MESSAGE QUEUE BROKER ──────────────────────────────────────────────────
+  mq-redis:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "512mb"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 640M
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── GATEWAY ───────────────────────────────────────────────────────────────
+  gateway:
+    image: nginx:1.25-bookworm
+    volumes:
+      - ./gateway_nginx_medium.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8000:80"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+    depends_on:
+      - order-service-1
+      - order-service-2
+      - order-service-3
+      - order-service-4
+      - stock-service-1
+      - stock-service-2
+      - stock-service-3
+      - stock-service-4
+      - payment-service-1
+      - payment-service-2
+      - payment-service-3
+      - payment-service-4
+    restart: unless-stopped
+
+  # ── ORCHESTRATOR (2 replicas) ─────────────────────────────────────────────
+  orchestrator-1: &orchestrator-service
+    build: ./orchestrator
+    image: orchestrator
+    environment: &orch-env
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
+      - ORCH_REDIS_PASSWORD=redis
+      - ORCH_REDIS_DB=0
+      - ORCH_SENTINEL_HOSTS=orch-redis-sentinel:26379
+      - ORCH_MASTER_NAME=orch-master
+      - ORCH_MAX_RETRIES=3
+      - ORCH_TASK_TIMEOUT_S=5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.4"
+          memory: 256M
+    depends_on:
+      mq-redis:
+        condition: service_healthy
+      orch-redis-sentinel:
+        condition: service_healthy
+    restart: unless-stopped
+
+  orchestrator-2:
+    <<: *orchestrator-service
+    environment: *orch-env
+
+  orch-redis-master:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--masterauth", "redis",
+              "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - orch-master-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 640M
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  orch-redis-replica:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--replicaof", "orch-redis-master", "6379",
+              "--masterauth", "redis", "--maxmemory", "512mb", "--appendonly", "yes"]
+    volumes:
+      - orch-replica-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: 640M
+    depends_on:
+      orch-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  orch-redis-sentinel:
+    image: redis:7.2-bookworm
+    command: >
+      sh -c "
+        echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+        echo 'sentinel monitor orch-master orch-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel auth-pass orch-master redis' >> /tmp/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds orch-master 5000' >> /tmp/sentinel.conf &&
+        echo 'sentinel failover-timeout orch-master 10000' >> /tmp/sentinel.conf &&
+        echo 'sentinel parallel-syncs orch-master 1' >> /tmp/sentinel.conf &&
+        redis-server /tmp/sentinel.conf --sentinel --port 26379
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 64M
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    depends_on:
+      orch-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── ORDER SERVICE (4 replicas × 8 workers, 3.5 CPU limit each) ──────────
+  order-service-1: &order-service
+    build: ./order
+    image: order:latest
+    environment: &order-env
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
+      - GATEWAY_URL=http://gateway:80
+      - CHECKOUT_MODE=saga
+      - REDIS_HOST=order-redis-master
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+      - REDIS_SENTINEL_HOSTS=order-redis-sentinel:26379
+      - REDIS_MASTER_NAME=order-master
+    command: gunicorn -b 0.0.0.0:5000 -w 8 --timeout 70 --log-level=info app:app
+    deploy:
+      resources:
+        limits:
+          cpus: "3.5"
+          memory: 512M
+    depends_on:
+      mq-redis:
+        condition: service_healthy
+      order-redis-sentinel:
+        condition: service_healthy
+    restart: unless-stopped
+
+  order-service-2:
+    <<: *order-service
+    environment: *order-env
+
+  order-service-3:
+    <<: *order-service
+    environment: *order-env
+
+  order-service-4:
+    <<: *order-service
+    environment: *order-env
+
+  order-redis-master:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--masterauth", "redis",
+              "--maxmemory", "1gb", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - order-master-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1280M
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  order-redis-replica:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--replicaof", "order-redis-master", "6379",
+              "--masterauth", "redis", "--maxmemory", "1gb", "--appendonly", "yes"]
+    volumes:
+      - order-replica-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: 1280M
+    depends_on:
+      order-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  order-redis-sentinel:
+    image: redis:7.2-bookworm
+    command: >
+      sh -c "
+        echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+        echo 'sentinel monitor order-master order-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel auth-pass order-master redis' >> /tmp/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds order-master 5000' >> /tmp/sentinel.conf &&
+        echo 'sentinel failover-timeout order-master 10000' >> /tmp/sentinel.conf &&
+        echo 'sentinel parallel-syncs order-master 1' >> /tmp/sentinel.conf &&
+        redis-server /tmp/sentinel.conf --sentinel --port 26379
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 64M
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    depends_on:
+      order-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── STOCK SERVICE (4 replicas × 8 workers) ───────────────────────────────
+  stock-service-1: &stock-service
+    build: ./stock
+    image: stock:latest
+    environment: &stock-env
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
+      - REDIS_HOST=stock-redis-master
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+      - REDIS_SENTINEL_HOSTS=stock-redis-sentinel:26379
+      - REDIS_MASTER_NAME=stock-master
+    command: gunicorn -b 0.0.0.0:5000 -w 8 --timeout 30 --log-level=info app:app
+    deploy:
+      resources:
+        limits:
+          cpus: "3.5"
+          memory: 512M
+    depends_on:
+      mq-redis:
+        condition: service_healthy
+      stock-redis-sentinel:
+        condition: service_healthy
+    restart: unless-stopped
+
+  stock-service-2:
+    <<: *stock-service
+    environment: *stock-env
+
+  stock-service-3:
+    <<: *stock-service
+    environment: *stock-env
+
+  stock-service-4:
+    <<: *stock-service
+    environment: *stock-env
+
+  stock-redis-master:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--masterauth", "redis",
+              "--maxmemory", "1gb", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - stock-master-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1280M
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  stock-redis-replica:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--replicaof", "stock-redis-master", "6379",
+              "--masterauth", "redis", "--maxmemory", "1gb", "--appendonly", "yes"]
+    volumes:
+      - stock-replica-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: 1280M
+    depends_on:
+      stock-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  stock-redis-sentinel:
+    image: redis:7.2-bookworm
+    command: >
+      sh -c "
+        echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+        echo 'sentinel monitor stock-master stock-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel auth-pass stock-master redis' >> /tmp/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds stock-master 5000' >> /tmp/sentinel.conf &&
+        echo 'sentinel failover-timeout stock-master 10000' >> /tmp/sentinel.conf &&
+        echo 'sentinel parallel-syncs stock-master 1' >> /tmp/sentinel.conf &&
+        redis-server /tmp/sentinel.conf --sentinel --port 26379
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 64M
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    depends_on:
+      stock-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── PAYMENT SERVICE (4 replicas × 8 workers) ─────────────────────────────
+  payment-service-1: &payment-service
+    build: ./payment
+    image: user:latest
+    environment: &payment-env
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
+      - REDIS_HOST=payment-redis-master
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+      - REDIS_SENTINEL_HOSTS=payment-redis-sentinel:26379
+      - REDIS_MASTER_NAME=payment-master
+    command: gunicorn -b 0.0.0.0:5000 -w 8 --timeout 30 --log-level=info app:app
+    deploy:
+      resources:
+        limits:
+          cpus: "3.5"
+          memory: 512M
+    depends_on:
+      mq-redis:
+        condition: service_healthy
+      payment-redis-sentinel:
+        condition: service_healthy
+    restart: unless-stopped
+
+  payment-service-2:
+    <<: *payment-service
+    environment: *payment-env
+
+  payment-service-3:
+    <<: *payment-service
+    environment: *payment-env
+
+  payment-service-4:
+    <<: *payment-service
+    environment: *payment-env
+
+  payment-redis-master:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--masterauth", "redis",
+              "--maxmemory", "1gb", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - payment-master-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1280M
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  payment-redis-replica:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--replicaof", "payment-redis-master", "6379",
+              "--masterauth", "redis", "--maxmemory", "1gb", "--appendonly", "yes"]
+    volumes:
+      - payment-replica-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: 1280M
+    depends_on:
+      payment-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  payment-redis-sentinel:
+    image: redis:7.2-bookworm
+    command: >
+      sh -c "
+        echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+        echo 'sentinel monitor payment-master payment-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel auth-pass payment-master redis' >> /tmp/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds payment-master 5000' >> /tmp/sentinel.conf &&
+        echo 'sentinel failover-timeout payment-master 10000' >> /tmp/sentinel.conf &&
+        echo 'sentinel parallel-syncs payment-master 1' >> /tmp/sentinel.conf &&
+        redis-server /tmp/sentinel.conf --sentinel --port 26379
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 64M
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    depends_on:
+      payment-redis-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  order-master-data:
+  order-replica-data:
+  stock-master-data:
+  stock-replica-data:
+  payment-master-data:
+  payment-replica-data:
+  orch-master-data:
+  orch-replica-data:
