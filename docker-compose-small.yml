@@ -12,7 +12,7 @@
 ##   order-redis:           0.2
 ##   stock-redis:           0.2
 ##   payment-redis:         0.2
-##   orch-redis:            0.2
+##   wal-redis:             0.2
 ##   ──────────────────────────
 ##   Total ≈ 5 CPUs
 
@@ -41,7 +41,21 @@ services:
       - payment-service
     restart: unless-stopped
 
-  # ── ORCHESTRATOR (1 replica, standalone Redis) ────────────────────────────
+  # ── WAL STORE (shared by all services, standalone) ───────────────────────
+  wal-redis:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "256mb",
+              "--appendonly", "yes", "--appendfsync", "always"]
+    volumes:
+      - wal-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── ORCHESTRATOR (1 replica) ──────────────────────────────────────────────
   orchestrator:
     build: ./orchestrator
     image: orchestrator
@@ -50,30 +64,18 @@ services:
       - MQ_REDIS_PORT=6379
       - MQ_REDIS_PASSWORD=redis
       - MQ_REDIS_DB=0
-      - ORCH_REDIS_PASSWORD=redis
-      - ORCH_REDIS_DB=0
-      - ORCH_REDIS_HOST=orch-redis
-      - ORCH_REDIS_PORT=6379
+      - WAL_REDIS_HOST=wal-redis
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
       - ORCH_MAX_RETRIES=3
       - ORCH_TASK_TIMEOUT_S=5
+      - ORCH_CONSUMER_NAME=orchestrator-1
     depends_on:
       mq-redis:
         condition: service_healthy
-      orch-redis:
+      wal-redis:
         condition: service_healthy
-    restart: unless-stopped
-
-  orch-redis:
-    image: redis:7.2-bookworm
-    command: ["redis-server", "--requirepass", "redis", "--maxmemory", "256mb",
-              "--appendonly", "yes", "--appendfsync", "everysec"]
-    volumes:
-      - orch-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
-      interval: 2s
-      timeout: 3s
-      retries: 10
     restart: unless-stopped
 
   # ── ORDER SERVICE (1 replica, 1 worker) ──────────────────────────────────
@@ -91,11 +93,17 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
       - REDIS_DB=0
+      - WAL_REDIS_HOST=wal-redis
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
     command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 70 --log-level=info app:app
     depends_on:
       mq-redis:
         condition: service_healthy
       order-redis:
+        condition: service_healthy
+      wal-redis:
         condition: service_healthy
     restart: unless-stopped
 
@@ -125,11 +133,17 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
       - REDIS_DB=0
+      - WAL_REDIS_HOST=wal-redis
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
     command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     depends_on:
       mq-redis:
         condition: service_healthy
       stock-redis:
+        condition: service_healthy
+      wal-redis:
         condition: service_healthy
     restart: unless-stopped
 
@@ -159,11 +173,17 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
       - REDIS_DB=0
+      - WAL_REDIS_HOST=wal-redis
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
     command: gunicorn -b 0.0.0.0:5000 -w 1 --timeout 30 --log-level=info app:app
     depends_on:
       mq-redis:
         condition: service_healthy
       payment-redis:
+        condition: service_healthy
+      wal-redis:
         condition: service_healthy
     restart: unless-stopped
 
@@ -184,4 +204,4 @@ volumes:
   order-data:
   stock-data:
   payment-data:
-  orch-data:
+  wal-data:

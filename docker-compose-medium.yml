@@ -4,9 +4,9 @@
 ##   mq-redis:                          0.5
 ##   gateway (nginx):                   1.0
 ##   orchestrator        ×2 (1.4 each): 2.8
-##   orch-redis-master:                 0.5
-##   orch-redis-replica:                0.3
-##   orch-redis-sentinel:               0.1
+##   wal-redis-master:                  0.5
+##   wal-redis-replica:                 0.3
+##   wal-redis-sentinel:                0.1
 ##   order-service       ×4 (3.5 each): 14.0
 ##   stock-service       ×4 (3.5 each): 14.0
 ##   payment-service     ×4 (3.5 each): 14.0
@@ -60,43 +60,13 @@ services:
       - payment-service-4
     restart: unless-stopped
 
-  # ── ORCHESTRATOR (2 replicas) ─────────────────────────────────────────────
-  orchestrator-1: &orchestrator-service
-    build: ./orchestrator
-    image: orchestrator
-    environment: &orch-env
-      - MQ_REDIS_HOST=mq-redis
-      - MQ_REDIS_PORT=6379
-      - MQ_REDIS_PASSWORD=redis
-      - MQ_REDIS_DB=0
-      - ORCH_REDIS_PASSWORD=redis
-      - ORCH_REDIS_DB=0
-      - ORCH_SENTINEL_HOSTS=orch-redis-sentinel:26379
-      - ORCH_MASTER_NAME=orch-master
-      - ORCH_MAX_RETRIES=3
-      - ORCH_TASK_TIMEOUT_S=5
-    deploy:
-      resources:
-        limits:
-          cpus: "1.4"
-          memory: 256M
-    depends_on:
-      mq-redis:
-        condition: service_healthy
-      orch-redis-sentinel:
-        condition: service_healthy
-    restart: unless-stopped
-
-  orchestrator-2:
-    <<: *orchestrator-service
-    environment: *orch-env
-
-  orch-redis-master:
+  # ── WAL STORE (shared by all services) ───────────────────────────────────
+  wal-redis-master:
     image: redis:7.2-bookworm
     command: ["redis-server", "--requirepass", "redis", "--masterauth", "redis",
-              "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "everysec"]
+              "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "always"]
     volumes:
-      - orch-master-data:/data
+      - wal-master-data:/data
     deploy:
       resources:
         limits:
@@ -109,32 +79,32 @@ services:
       retries: 10
     restart: unless-stopped
 
-  orch-redis-replica:
+  wal-redis-replica:
     image: redis:7.2-bookworm
-    command: ["redis-server", "--requirepass", "redis", "--replicaof", "orch-redis-master", "6379",
-              "--masterauth", "redis", "--maxmemory", "512mb", "--appendonly", "yes"]
+    command: ["redis-server", "--requirepass", "redis", "--replicaof", "wal-redis-master", "6379",
+              "--masterauth", "redis", "--maxmemory", "512mb", "--appendonly", "yes", "--appendfsync", "always"]
     volumes:
-      - orch-replica-data:/data
+      - wal-replica-data:/data
     deploy:
       resources:
         limits:
           cpus: "0.3"
           memory: 640M
     depends_on:
-      orch-redis-master:
+      wal-redis-master:
         condition: service_healthy
     restart: unless-stopped
 
-  orch-redis-sentinel:
+  wal-redis-sentinel:
     image: redis:7.2-bookworm
     command: >
       sh -c "
         echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
-        echo 'sentinel monitor orch-master orch-redis-master 6379 1' >> /tmp/sentinel.conf &&
-        echo 'sentinel auth-pass orch-master redis' >> /tmp/sentinel.conf &&
-        echo 'sentinel down-after-milliseconds orch-master 5000' >> /tmp/sentinel.conf &&
-        echo 'sentinel failover-timeout orch-master 10000' >> /tmp/sentinel.conf &&
-        echo 'sentinel parallel-syncs orch-master 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel monitor wal-master wal-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel auth-pass wal-master redis' >> /tmp/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds wal-master 5000' >> /tmp/sentinel.conf &&
+        echo 'sentinel failover-timeout wal-master 10000' >> /tmp/sentinel.conf &&
+        echo 'sentinel parallel-syncs wal-master 1' >> /tmp/sentinel.conf &&
         redis-server /tmp/sentinel.conf --sentinel --port 26379
       "
     deploy:
@@ -148,9 +118,56 @@ services:
       timeout: 3s
       retries: 15
     depends_on:
-      orch-redis-master:
+      wal-redis-master:
         condition: service_healthy
     restart: unless-stopped
+
+  # ── ORCHESTRATOR (2 replicas) ─────────────────────────────────────────────
+  orchestrator-1: &orchestrator-service
+    build: ./orchestrator
+    image: orchestrator
+    environment: &orch-env
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
+      - WAL_REDIS_HOST=wal-redis-master
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_MASTER_NAME=wal-master
+      - ORCH_MAX_RETRIES=3
+      - ORCH_TASK_TIMEOUT_S=5
+      - ORCH_CONSUMER_NAME=orchestrator-1
+    deploy:
+      resources:
+        limits:
+          cpus: "1.4"
+          memory: 256M
+    depends_on:
+      mq-redis:
+        condition: service_healthy
+      wal-redis-sentinel:
+        condition: service_healthy
+    restart: unless-stopped
+
+  orchestrator-2:
+    <<: *orchestrator-service
+    environment:
+      - MQ_REDIS_HOST=mq-redis
+      - MQ_REDIS_PORT=6379
+      - MQ_REDIS_PASSWORD=redis
+      - MQ_REDIS_DB=0
+      - WAL_REDIS_HOST=wal-redis-master
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_MASTER_NAME=wal-master
+      - ORCH_MAX_RETRIES=3
+      - ORCH_TASK_TIMEOUT_S=5
+      - ORCH_CONSUMER_NAME=orchestrator-2
 
   # ── ORDER SERVICE (4 replicas × 8 workers, 3.5 CPU limit each) ──────────
   order-service-1: &order-service
@@ -169,6 +186,12 @@ services:
       - REDIS_DB=0
       - REDIS_SENTINEL_HOSTS=order-redis-sentinel:26379
       - REDIS_MASTER_NAME=order-master
+      - WAL_REDIS_HOST=wal-redis-master
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_MASTER_NAME=wal-master
     command: gunicorn -b 0.0.0.0:5000 -w 8 --timeout 70 --log-level=info app:app
     deploy:
       resources:
@@ -179,6 +202,8 @@ services:
       mq-redis:
         condition: service_healthy
       order-redis-sentinel:
+        condition: service_healthy
+      wal-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -270,6 +295,12 @@ services:
       - REDIS_DB=0
       - REDIS_SENTINEL_HOSTS=stock-redis-sentinel:26379
       - REDIS_MASTER_NAME=stock-master
+      - WAL_REDIS_HOST=wal-redis-master
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_MASTER_NAME=wal-master
     command: gunicorn -b 0.0.0.0:5000 -w 8 --timeout 30 --log-level=info app:app
     deploy:
       resources:
@@ -280,6 +311,8 @@ services:
       mq-redis:
         condition: service_healthy
       stock-redis-sentinel:
+        condition: service_healthy
+      wal-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -371,6 +404,12 @@ services:
       - REDIS_DB=0
       - REDIS_SENTINEL_HOSTS=payment-redis-sentinel:26379
       - REDIS_MASTER_NAME=payment-master
+      - WAL_REDIS_HOST=wal-redis-master
+      - WAL_REDIS_PORT=6379
+      - WAL_REDIS_PASSWORD=redis
+      - WAL_REDIS_DB=0
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_MASTER_NAME=wal-master
     command: gunicorn -b 0.0.0.0:5000 -w 8 --timeout 30 --log-level=info app:app
     deploy:
       resources:
@@ -381,6 +420,8 @@ services:
       mq-redis:
         condition: service_healthy
       payment-redis-sentinel:
+        condition: service_healthy
+      wal-redis-sentinel:
         condition: service_healthy
     restart: unless-stopped
 
@@ -458,11 +499,11 @@ services:
     restart: unless-stopped
 
 volumes:
+  wal-master-data:
+  wal-replica-data:
   order-master-data:
   order-replica-data:
   stock-master-data:
   stock-replica-data:
   payment-master-data:
   payment-replica-data:
-  orch-master-data:
-  orch-replica-data:
