@@ -10,6 +10,8 @@ A fault-tolerant, distributed e-commerce backend built with Flask microservices,
 4. [Fault Tolerance & Reliability](#fault-tolerance--reliability)
 5. [API Reference](#api-reference)
 6. [Getting Started](#getting-started)
+   - [Docker Compose](#docker-compose)
+   - [Kubernetes — minikube](#kubernetes--minikube-local)
 7. [Configuration](#configuration)
 8. [Testing](#testing)
 9. [Technology Stack](#technology-stack)
@@ -147,21 +149,40 @@ All state mutations use Redis `WATCH/MULTI/EXEC` optimistic locking with up to 1
 
 ## Getting Started
 
-### Docker Compose (Local Development)
+### Docker Compose
+
+Three compose files are provided targeting different CPU budgets. All expose the gateway on `http://localhost:8000`.
 
 **Prerequisites:** Docker ≥ 24, Docker Compose v2.
 
-1.  **Start the stack:**
-    ```bash
-    docker compose down -v          # wipe old volumes (clean slate)
-    docker compose up --build       # build images and start all 22 containers
-    ```
-    The gateway is available at `http://localhost:8000` once all services report healthy (~10–15 seconds).
+#### Small — single instance (~5 CPUs)
+One replica and one gunicorn worker per service, one orchestrator instance, standalone Redis per service (no Sentinel).
 
-2.  **Run tests:**
-    ```bash
-    bash test-scripts/run_all.sh
-    ```
+```bash
+docker compose -f docker-compose-small.yml down -v
+docker compose -f docker-compose-small.yml up --build
+```
+
+#### Medium — 50 CPUs (hard limit)
+Four replicas per service (8 workers each, 3.5 CPU cap), 2 orchestrator replicas (1.4 CPU each), full Redis Sentinel HA for all services including orchestrator. Total hard limit: 49.9 CPUs.
+
+```bash
+docker compose -f docker-compose-medium.yml down -v
+docker compose -f docker-compose-medium.yml up --build
+```
+
+#### Large — 90 CPUs (hard limit)
+Eight replicas per service (8 workers each, 3.1 CPU cap), 4 orchestrator replicas (1.5 CPU each), full Redis Sentinel HA for all services including orchestrator. Designed for a 96-core machine, leaving ~6 CPUs for locust clients. Total hard limit: 89.8 CPUs.
+
+```bash
+docker compose -f docker-compose-large.yml down -v
+docker compose -f docker-compose-large.yml up --build
+```
+
+**Run tests** (any tier):
+```bash
+bash test-scripts/run_all.sh
+```
 
 ### Kubernetes — minikube (Local)
 
