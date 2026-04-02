@@ -2,7 +2,7 @@ Contributions
 
 
 Atharva Dagaonkar
-Role: 2PC Lead
+Role: 2PC and Orchestrator Implementation
 
 - Authored task-split.md and project design documents
 - Implemented 2PC coordinator in order/app.py: checkout_2pc(), _abort_2pc(), recover_2pc()
@@ -13,6 +13,8 @@ Role: 2PC Lead
 - Added concurrent worker guard preventing two gunicorn workers from double-claiming the same order
 - Fixed soft-reservation guards to reject deductions below reserved amounts
 - Wrote 2PC test scripts: mode-switching (07_mode_flag.sh) and end-to-end protocol tests (09_2pc_protocol.sh)
+- Implemented the Orchestrator Service with retry logic and extensive test suite
+- Modularised order service into separate SAGA, 2PC, RPC and DB files
 
 
 Pranav Gupta
