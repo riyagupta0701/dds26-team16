@@ -51,7 +51,7 @@ A fault-tolerant, distributed e-commerce backend built with Flask microservices,
               └─────────────────────────┘
 ```
 
-The system is composed of three logical services (Order, Stock, Payment) and an **Orchestrator** that coordinates multi-service transactions. Each service runs as **2 application replicas** behind a shared Nginx upstream pool. For data persistence and high availability, each service — including the orchestrator — has its own isolated **Redis master + replica + Sentinel** cluster. A shared **WAL Redis** cluster (master + replica + Sentinel) stores all Write-Ahead Log entries independently of every service's business data. The complete stack totals **22 containers**.
+The system is composed of three logical services (Order, Stock, Payment) and an **Orchestrator** that coordinates multi-service transactions. Each service runs as **2 application replicas** behind a shared Nginx upstream pool. For data persistence and high availability, each of the three business services has its own isolated **Redis master + replica + Sentinel** cluster. The orchestrator persists its WAL state to the shared **WAL Redis** cluster and uses the shared MQ Redis for messaging — it does not have a separate Redis cluster. A shared **WAL Redis** cluster (master + replica + Sentinel) stores all Write-Ahead Log entries independently of every service's business data. The complete stack totals **22 containers**.
 
 ### Redis Architecture: State vs. Messaging
 
@@ -232,11 +232,9 @@ Configuration is managed via environment variables in `docker-compose.yml` or K8
 | `MQ_REDIS_PORT` | all | Port for the MQ connection | `6379` |
 | `MQ_REDIS_PASSWORD`| all | Password for the MQ connection | `redis` |
 | `MQ_REDIS_DB` | all | DB index for the MQ connection | `0` |
-| `ORCH_MAX_RETRIES` | orchestrator | Max task dispatch retries per attempt | `3` |
-| `ORCH_TASK_TIMEOUT_S` | orchestrator | Per-attempt reply timeout in seconds | `5` |
-| `ORCH_CONSUMER_NAME` | orchestrator | Unique consumer name per replica | `orchestrator-1` |
 | `ORCH_MAX_RETRIES` | orchestrator | Max retry attempts per task delivery | `3` |
 | `ORCH_TASK_TIMEOUT_S` | orchestrator | Timeout (seconds) waiting for a task reply | `5` |
+| `ORCH_CONSUMER_NAME` | orchestrator | Unique consumer name per replica | `orchestrator-1` |
 
 ## Testing Suite
 
