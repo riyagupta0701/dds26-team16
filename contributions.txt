@@ -25,6 +25,8 @@ Role: Architecture & Fault Tolerance
 - Decoupled State and Messaging layers by implementing independent MQ connection pools with dedicated environment variables.
 - Developed enhanced `/health` endpoints for all microservices to verify both Database and MQ readiness.
 - Implemented synchronous and transactional Saga/2PC recovery logic to ensure consistent state after service crashes.
+- Reviewed multiple PRs in this phase 2 of the project
+- Implemented the retry logic for orchestrator (order retry after failure)
 
 
 Riya Gupta
