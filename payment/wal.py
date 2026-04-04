@@ -1,6 +1,4 @@
 """
-wal.py — Decoupled Write-Ahead Log connection for the payment service.
-
 WAL entries stored here:
   wal:payment:2pc:{order_id}:{user_id}  → bytes  (prepared/committed/aborted)
 

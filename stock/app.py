@@ -76,6 +76,7 @@ class StockValue(Struct):
     stock: int
     price: int
 
+
 def response_success(body, status_code=200):
     return {"status_code": status_code, "body": body}
 
@@ -309,7 +310,7 @@ def subtract_stock_batch_logic(items_json: str, transaction_id: str | None = Non
     return response_error("Conflict: could not subtract stock batch after retries")
 
 
-# ─── 2PC Participant Endpoints ─────────────────────────────────────────────────
+# 2PC Participant Endpoints
 # Per-transaction WAL entries: 2pc:stock:{order_id}:{item_id}  → b"prepared" | b"committed" | b"aborted"
 # All three endpoints use WATCH/MULTI/EXEC for optimistic concurrency control
 

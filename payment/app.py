@@ -58,7 +58,6 @@ else:
     )
 
 # Separate connection for Message Queue operations
-# Defaults to the same host as DB, but allows splitting in production
 mq: redis.Redis = redis.Redis(host=os.environ['MQ_REDIS_HOST'],
                               port=int(os.environ['MQ_REDIS_PORT']),
                               password=os.environ['MQ_REDIS_PASSWORD'],
@@ -76,7 +75,6 @@ atexit.register(close_db_connection)
 class UserValue(Struct):
     credit: int
 
-# ─── Logic Helpers ────────────────────────────────────────────────────────────
 
 def response_success(body, status_code=200):
     return {"status_code": status_code, "body": body}
@@ -94,7 +92,6 @@ def get_user_from_db(user_id: str) -> UserValue | None:
 def _payment_tx_key(tx_id: str) -> str:
     return f"payment:tx:{tx_id}"
 
-# ─── Business Logic (Decoupled) ───────────────────────────────────────────────
 
 def create_user_logic():
     key = str(uuid.uuid4())
@@ -132,7 +129,6 @@ def add_credit_logic(user_id: str, amount: int, transaction_id: str | None = Non
     """
     Idempotency: uses a Redis WATCH/MULTI/EXEC optimistic lock so concurrent
     retries from the benchmark cannot double-add funds.
-    If transaction_id is provided (Refund/Rollback), implements Tombstone pattern.
     """
     amount = int(amount)
     tx_key = _payment_tx_key(transaction_id) if transaction_id else None
@@ -151,7 +147,7 @@ def add_credit_logic(user_id: str, amount: int, transaction_id: str | None = Non
                         pipe.unwatch()
                         return response_success("Refund already processed (idempotent)")
                     else:
-                        # Tombstone: Original charge never happened or is delayed.
+                        # Original charge never happened or is delayed.
                         # Mark as REFUNDED to prevent future charges.
                         pipe.multi()
                         pipe.set(tx_key, TX_REFUNDED)
@@ -183,7 +179,6 @@ def remove_credit_logic(user_id: str, amount: int, transaction_id: str | None = 
     Atomically deduct credit using optimistic locking.
     Respects 2PC soft-reservations: only unreserved credit may be deducted.
     Returns 400 if credit would fall below the currently reserved amount.
-    If transaction_id is provided (Charge), implements Tombstone pattern.
     """
     amount = int(amount)
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
@@ -231,14 +226,8 @@ def remove_credit_logic(user_id: str, amount: int, transaction_id: str | None = 
     return response_error("Conflict: could not deduct credit after retries")
 
 
-# ─── 2PC Participant Endpoints ─────────────────────────────────────────────────
-#
-# Soft-reservations are stored as plain Redis integers under:
-#   reserved:payment:{user_id}
-#
-# Per-transaction WAL entries live under:
-#   2pc:payment:{order_id}:{user_id}  → b"prepared" | b"committed" | b"aborted"
-#
+# 2PC Participant Endpoints
+# Per-transaction WAL entries: 2pc:payment:{order_id}:{user_id}  → b"prepared" | b"committed" | b"aborted"
 # All three endpoints use WATCH/MULTI/EXEC for optimistic concurrency control.
 
 def _payment_reserved_key(user_id: str) -> str:
@@ -248,7 +237,7 @@ def prepare_pay_logic(order_id: str, user_id: str, amount: int):
     """
     2PC Phase 1 - PREPARE (participant: payment).
 
-    WAL state read/written in wal-redis (decoupled).
+    WAL state read/written in wal-redis.
     Soft-reservation written in db-redis alongside credit balance so it can
     be checked atomically in a single WATCH/MULTI/EXEC pipeline.
 
@@ -439,8 +428,6 @@ def abort_pay_logic(order_id: str, user_id: str, amount: int):
     return response_success("Abort: OK")
 
 
-# ─── Flask Routes (Wrappers) ──────────────────────────────────────────────────
-
 @app.post('/create_user')
 def create_user():
     res = create_user_logic()
@@ -492,8 +479,6 @@ def health_check():
         app.logger.error(f"Health check failed: {e}")
         return jsonify({"status": "unhealthy", "db": "disconnected", "mq": "disconnected"}), 500
 
-
-# ─── Message Queue Listener ───────────────────────────────────────────────────
 
 def run_event_listener():
     stream_key = 'events:payment'
