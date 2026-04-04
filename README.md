@@ -1,6 +1,6 @@
-# Distributed Web Shop — DDS26 Team 16
+# DDS26 - Team 16
 
-A fault-tolerant, distributed e-commerce backend built with Flask microservices, Redis, and Nginx. This architecture utilizes **Event-Driven Inter-Service Communication** via Redis Streams, supporting both **Saga (orchestration)** and **Two-Phase Commit (2PC)** protocols.
+A fault-tolerant, distributed e-commerce backend built with Flask microservices, Redis, and Nginx. This architecture utilizes Event-Driven Inter-Service Communication via Redis Streams, supporting both Saga (orchestration) and Two-Phase Commit (2PC) protocols.
 
 ## Table of Contents
 
@@ -46,15 +46,15 @@ A fault-tolerant, distributed e-commerce backend built with Flask microservices,
                            │
               ┌────────────┴────────────┐
               │  Redis Master + Replica │  (one cluster per service,
-              │  + Sentinel Cluster     │   incl. orchestrator)
+              │  + Sentinel Cluster     │   including orchestrator)
               └─────────────────────────┘
 ```
 
-The system is composed of three logical services (Order, Stock, Payment) and an **Orchestrator** that coordinates multi-service transactions. Each service runs as **2 application replicas** behind a shared Nginx upstream pool. For data persistence and high availability, each of the three business services has its own isolated **Redis master + replica + 3-node Sentinel** cluster. The orchestrator persists its WAL state to the shared **WAL Redis** cluster and uses the shared MQ Redis for messaging — it does not have a separate Redis cluster. A shared **WAL Redis** cluster (master + replica + 3-node Sentinel) stores all Write-Ahead Log entries independently of every service's business data. All Sentinel clusters use a **quorum of 2** (majority of 3), ensuring correct failover decisions and tolerance of a single Sentinel failure. The complete stack totals **30 containers**.
+The system is composed of three logical services (Order, Stock, Payment) and an **Orchestrator** that coordinates multi-service transactions. For the base architecture, each service runs as **2 application replicas** behind a shared Nginx upstream pool. For data persistence and high availability, each of the three business services has its own isolated **Redis master + replica + 3-node Sentinel** cluster. The orchestrator persists its WAL state to the shared **WAL Redis** cluster and uses the shared MQ Redis for messaging; it does not have a separate Redis cluster. A shared **WAL Redis** cluster (master + replica + 3-node Sentinel) stores all Write-Ahead Log entries independently of every service's business data. All Sentinel clusters use a **quorum of 2** (majority of 3), ensuring correct failover decisions and tolerance of a single Sentinel failure. The complete stack totals **30 containers**.
 
 ### Redis Architecture: State vs. Messaging
 
-To ensure high availability and prevent head-of-line blocking, each service maintains **two distinct connection pools**:
+To ensure high availability and prevent head-of-line blocking, each service maintains two distinct connection pools:
 
 1.  **State Connection (`db`):** Used for persistent business data (e.g., inventory counts, user credits, order status).
 2.  **Messaging Connection (`mq`):** Used for inter-service communication (Redis Streams, Consumer Groups, RPC replies).
@@ -98,7 +98,7 @@ A high-integrity protocol for atomicity across services, also coordinated throug
 ## Fault Tolerance & Reliability
 
 ### Tombstone Pattern (Idempotency)
-A critical challenge in distributed systems is message reordering or retries. If a rollback command arrives *before* the original request, the system uses **Tombstones**:
+A critical challenge in distributed systems is message reordering or retries. If a rollback command arrives before the original request, the system uses **Tombstones**:
 *   When a rollback arrives for an unknown transaction, the service records a "Tombstone" (e.g., `TX_ROLLED_BACK`).
 *   If the original request arrives later, the service sees the Tombstone and ignores the request.
 
@@ -117,7 +117,7 @@ Every WAL entry in the system lives in a **dedicated `wal-redis` cluster** that 
 | Orchestrator in-flight set | `wal-redis` | `wal:orch:pending` (Set) |
 | Orchestrator recovery locks | `wal-redis` | `wal:orch:lock:{batch_id}` (TTL key) |
 
-**Why this matters:** if `order-redis`, `stock-redis`, or `payment-redis` is wiped or corrupted, the WAL is untouched. On restart, the service reads its business data (which may be partially restored via AOF/replica) and reads the WAL from `wal-redis` to determine which transactions need to be committed or rolled back. The two stores are never written in the same pipeline or transaction.
+If `order-redis`, `stock-redis`, or `payment-redis` is wiped or corrupted, the WAL is untouched. On restart, the service reads its business data (which may be partially restored via AOF/replica) and reads the WAL from `wal-redis` to determine which transactions need to be committed or rolled back. The two stores are never written in the same pipeline or transaction.
 
 **Separation rule enforced in code:** every service has a `wal.py` module that opens an independent Redis connection to `wal-redis`. Business writes go to `db` (business Redis); WAL writes go to `wal` (WAL Redis). These are never mixed in the same `WATCH/MULTI/EXEC` pipeline.
 
@@ -157,9 +157,9 @@ Three compose files are provided targeting different CPU budgets. All expose the
 #### Testing - general docker compose setup
 Docker compose setup that is similar to "medium" and "large" configuration but with fewer resources such that it can be run on our laptops for testing.
 
-**Prerequisites:** For the tests you need to install pytest and requests:
+**Prerequisites:** You need to install the defined requirements:
 ```bash
-pip install pytest requests
+pip install -r requirements.txt
 ```
 
 **Run tests** (using the default `docker-compose.yml`):
