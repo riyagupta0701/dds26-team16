@@ -94,6 +94,15 @@ run_test "$SCRIPT_DIR/07_mode_flag.sh"
 # Orchestrator integration tests (Python unittest — saga, 2PC, concurrency, resilience)
 run_test "$SCRIPT_DIR/12_orchestrator.sh"
 
+# Extended fault tolerance tests (WAL Redis, MQ Redis, process kills, sequential kills, orchestrator under load)
+if [ "${SKIP_FAULT_TESTS:-0}" != "1" ]; then
+  run_test "$SCRIPT_DIR/15_fault_wal_redis_master.sh"
+  run_test "$SCRIPT_DIR/16_fault_mq_redis.sh"
+  run_test "$SCRIPT_DIR/17_fault_kill_process.sh"
+  run_test "$SCRIPT_DIR/18_fault_sequential_kills.sh"
+  run_test "$SCRIPT_DIR/19_fault_orchestrator_under_load.sh"
+fi
+
 # Final summary
 echo ""
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"

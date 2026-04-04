@@ -44,7 +44,6 @@ B_RUNNING   = 'RUNNING'
 B_COMPLETED = 'COMPLETED'
 B_FAILED    = 'FAILED'
 
-# ── MQ connection (transient — not the WAL store) ──────────────────────────────
 mq: redis.Redis = redis.Redis(
     host=MQ_REDIS_HOST, port=MQ_REDIS_PORT,
     password=MQ_REDIS_PASSWORD, db=MQ_REDIS_DB,
@@ -87,7 +86,6 @@ def dispatch_task(task: dict) -> dict:
             'error': f'No response after {MAX_RETRIES} attempts'}
 
 
-# ── Batch processor ────────────────────────────────────────────────────────────
 def _all_terminal(tasks_by_id: dict) -> bool:
     return all(t['state'] in TERMINAL_STATES for t in tasks_by_id.values())
 
@@ -122,8 +120,6 @@ def process_batch(batch: dict) -> None:
       3. complete_batch() is called on final success or failure; it updates the
          JSON snapshot and removes the batch from wal:orch:pending.
 
-    The MQ reply (rpush to reply_to) happens AFTER the WAL write, so the caller
-    (order service) only gets a result once the WAL is settled.
     """
     batch_id = batch['batch_id']
     reply_to = batch['reply_to']
@@ -142,7 +138,6 @@ def process_batch(batch: dict) -> None:
         if _all_terminal(tasks_by_id):
             break
 
-        # Tasks ready to dispatch: PENDING with all deps DELIVERED_OK
         ready = [
             t for t in tasks_by_id.values()
             if t['state'] == S_PENDING
@@ -161,8 +156,6 @@ def process_batch(batch: dict) -> None:
             break
 
         # ── Pre-wave WAL write ─────────────────────────────────────────────────
-        # Mark tasks IN_PROGRESS and persist to WAL *before* dispatching.
-        # If we crash during dispatch, recovery sees IN_PROGRESS and resets to PENDING.
         for t in ready:
             tasks_by_id[t['task_id']]['state'] = S_IN_PROGRESS
         batch['tasks'] = tasks_by_id
@@ -170,14 +163,12 @@ def process_batch(batch: dict) -> None:
             persist_batch(batch)
         except redis.exceptions.RedisError:
             logger.error('process_batch %s: cannot write pre-wave WAL, aborting batch', batch_id)
-            # Cannot proceed safely without a WAL entry — mark failed and exit.
             for t in tasks_by_id.values():
                 if t['state'] == S_IN_PROGRESS:
                     t['state'] = S_DELIVERY_FAILED
                     t['error'] = 'WAL write failed before dispatch'
             break
 
-        # ── Dispatch ready tasks concurrently ─────────────────────────────────
         results: list[dict] = []
         lock = threading.Lock()
 
@@ -192,19 +183,16 @@ def process_batch(batch: dict) -> None:
         for th in threads:
             th.join()
 
-        # Merge results back and cascade
         for r in results:
             tasks_by_id[r['task_id']] = r
         _cascade_skipped(tasks_by_id)
 
-        # ── Post-wave WAL write ────────────────────────────────────────────────
         batch['tasks'] = tasks_by_id
         try:
             persist_batch(batch)
         except redis.exceptions.RedisError:
             logger.error('process_batch %s: cannot write post-wave WAL (continuing)', batch_id)
 
-    # ── Finalise ───────────────────────────────────────────────────────────────
     has_delivery_failed = any(t['state'] == S_DELIVERY_FAILED for t in tasks_by_id.values())
     batch_status = B_FAILED if has_delivery_failed else B_COMPLETED
     batch['status'] = batch_status
@@ -233,8 +221,6 @@ def process_batch(batch: dict) -> None:
     except Exception as exc:
         logger.error('process_batch %s: failed to complete WAL or push reply: %s', batch_id, exc)
         # Best-effort: try pushing the reply even if WAL cleanup failed.
-        # wal:orch:pending still holds the batch_id; recovery will re-drive
-        # (idempotent) and clean up on next startup.
         try:
             mq.rpush(reply_to, reply_payload)
             mq.expire(reply_to, 120)
@@ -244,7 +230,6 @@ def process_batch(batch: dict) -> None:
     logger.info('process_batch %s: %s', batch_id, batch_status)
 
 
-# ── Recovery ───────────────────────────────────────────────────────────────────
 def recover_batches() -> None:
     """
     Startup recovery sweep. Reads wal:orch:pending from wal-redis and
@@ -252,11 +237,8 @@ def recover_batches() -> None:
 
     Uses distributed locks (wal:orch:lock:{batch_id}) so two orchestrator
     replicas racing at startup do not both re-drive the same batch.
-
-    Participant services are all idempotent (tombstone / WAL state machine),
-    so re-driving a batch that was partially completed is safe.
     """
-    time.sleep(5)  # give other services time to come up first
+    time.sleep(5)
 
     batch_ids = pending_batch_ids()
     if not batch_ids:
@@ -278,13 +260,10 @@ def recover_batches() -> None:
                 continue
 
             if batch.get('status') in (B_COMPLETED, B_FAILED):
-                # Terminal but pending set was not cleaned — just clean up.
                 remove_from_pending(batch_id)
                 continue
 
             # Reset any IN_PROGRESS tasks to PENDING so they are re-dispatched.
-            # Participant idempotency (tombstones / WAL state machines in wal-redis)
-            # prevents double-apply of already-committed tasks.
             tasks = batch.get('tasks', {})
             if isinstance(tasks, dict):
                 for t in tasks.values():
@@ -302,7 +281,6 @@ def recover_batches() -> None:
             release_lock(batch_id)
 
 
-# ── Stream listener ────────────────────────────────────────────────────────────
 def run_listener() -> None:
     """
     Consume messages from events:orchestrator stream.
@@ -346,7 +324,6 @@ def run_listener() -> None:
                         reply_to = fields[b'reply_to'].decode()
                         tasks_raw = json.loads(fields[b'tasks'].decode())
 
-                        # Normalize list → dict with initial PENDING state
                         if isinstance(tasks_raw, list):
                             tasks = {
                                 t['task_id']: {
@@ -369,9 +346,6 @@ def run_listener() -> None:
                         }
 
                         # Write WAL entry BEFORE spawning the processing thread.
-                        # If we crash after this write, recovery will find and
-                        # re-drive the batch. If persist_batch fails, we skip
-                        # spawning — the caller will time out and retry.
                         try:
                             persist_batch(batch)
                         except redis.exceptions.RedisError as exc:
@@ -394,7 +368,6 @@ def run_listener() -> None:
             time.sleep(1)
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
 def main() -> None:
     threading.Thread(target=recover_batches, daemon=True).start()
     run_listener()
