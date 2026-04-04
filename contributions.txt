@@ -1,7 +1,7 @@
 Contributions
 
 
-Atharva Dagaonkar
+Atharva Dagaonkar (6406947) a.m.dagaonkar@student.tudelft.nl
 
 - Authored task-split.md and project design documents
 - Implemented 2PC coordinator in order/app.py: checkout_2pc(), _abort_2pc(), recover_2pc()
