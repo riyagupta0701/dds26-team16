@@ -36,7 +36,7 @@ Riya Gupta (6452272), r.gupta-8@student.tudelft.nl
 - Decoupled Write-Ahead Logs from all service containers into a shared wal-redis cluster after the orchestrator service implementation
 
 
-Jimmy Oei
+Jimmy Oei (6540031), J.T.Oei-1@student.tudelft.nl
 
 - Designed and Implemented the Kubernetes deployment architecture
 - Wrote test scripts 6, 11-14, and the kubernetes parts of each test
