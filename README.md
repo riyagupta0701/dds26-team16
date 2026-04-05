@@ -110,62 +110,51 @@ All state mutations use Redis `WATCH/MULTI/EXEC` optimistic locking with up to 1
 
 ### Docker Compose
 
-Three compose files are provided targeting different CPU budgets. All expose the gateway on `http://localhost:8000`.
+Three compose files are provided targeting different CPU budgets, plus a general-purpose compose for local testing. All expose the gateway on `http://localhost:8000`.
 
 **Prerequisites:** Docker ≥ 24, Docker Compose v2.
 
+#### Testing - general docker compose setup
+Docker compose setup that is similar to "medium" and "large" configuration but with fewer resources such that it can be run on our laptops for testing.
+
+**Prerequisites:** For the tests you need to install pytest and requests:
+```bash
+pip install pytest requests
+```
+
+**Run tests** (using the default `docker-compose.yml`):
+```bash
+docker compose up --build
+bash test-scripts/run_all.sh
+```
+
 #### Small — single instance (~5 CPUs)
-One replica and one gunicorn worker per service.
+One replica and one gunicorn worker per service. Standalone Redis per service (no Sentinel).
 
 ```bash
 docker compose -f docker-compose-small.yml down -v
 docker compose -f docker-compose-small.yml up --build
 ```
 
-#### Medium — ~50 CPUs
-Four replicas per service, each capped at 3.8 CPUs (total hard limit: 49.8 CPUs).
+#### Medium — 50 CPUs (hard limit)
+Four replicas per service, each capped at 3.75 CPUs. Full Redis Sentinel HA (3 sentinels per cluster, quorum=2).
 
 ```bash
 docker compose -f docker-compose-medium.yml down -v
 docker compose -f docker-compose-medium.yml up --build
 ```
 
-#### Large — ~90 CPUs
-Eight replicas per service, each capped at 3.4 CPUs (total hard limit: 89.4 CPUs). Designed for 96-core machine, leaving ~6 CPUs for locust clients.
+#### Large — 90 CPUs (hard limit)
+Eight replicas per service, each capped at 3.4 CPUs. Designed for 96-core machine, leaving ~6 CPUs for locust clients. Full Redis Sentinel HA (3 sentinels per cluster, quorum=2).
 
 ```bash
 docker compose -f docker-compose-large.yml down -v
 docker compose -f docker-compose-large.yml up --build
 ```
 
-### Kubernetes — minikube (Local)
-
-**Prerequisites:** minikube, kubectl, docker.
-
-1.  **Start minikube:**
-    ```bash
-    minikube start
-    ```
-
-2.  **Deploy the stack:**
-    ```bash
-    bash deploy-charts-minikube.sh
-    ```
-    This builds the images into minikube's Docker daemon and applies all manifests in `k8s/` (Redis Sentinel clusters, gateway, and app services).
-
-3.  **Access the Gateway:**
-    In a separate terminal, forward the ingress port:
-    ```bash
-    kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80
-    ```
-    Then run tests targeting the minikube gateway:
-    ```bash
-    BASE_URL=http://localhost:8080 bash test-scripts/run_all.sh
-    ```
-
 ## Configuration
 
-Configuration is managed via environment variables in `docker-compose.yml` or K8s manifests.
+Configuration is managed via environment variables in `docker-compose.yml`.
 
 | Variable | Service | Description | Default |
 |----------|---------|-------------|---------|
@@ -183,14 +172,37 @@ Configuration is managed via environment variables in `docker-compose.yml` or K8
 
 ## Testing Suite
 
+**Prerequisites:** `pip install pytest requests`
+
+The test suite runs core correctness tests (01–04, 08) in **both saga and 2pc modes**. It switches modes at runtime via the `/orders/mode/<mode>` API — no restart needed. Fault tolerance tests run in saga mode (the default), since the infrastructure-level fault handling (nginx failover, Sentinel, container restart) is mode-agnostic.
+
+Run all tests:
+```bash
+bash test-scripts/run_all.sh
+```
+
+Skip fault tolerance tests (faster):
+```bash
+SKIP_FAULT_TESTS=1 bash test-scripts/run_all.sh
+```
+
 | Script | Description |
 |--------|-------------|
 | `01_happy_path.sh` | Full Saga checkout success: stock decreases, credit decreases, order marked `paid`. |
 | `02_idempotency.sh` | Retrying a paid checkout returns 200; retrying a failed checkout returns 400. |
+| `03_compensation_payment_fails.sh` | Checkout with insufficient credit; verifies stock is rolled back. |
+| `04_compensation_stock_fails.sh` | Checkout with insufficient stock; verifies credit is not deducted. |
 | `05_fault_app_replica.sh` | Kills app replicas; Nginx routes to survivors; checkout always succeeds. |
 | `06_fault_redis_master.sh` | Kills Redis master; Sentinel promotes replica; checkout uninterrupted. |
-| `09_2pc_protocol.sh` | Exercises 2PC participant endpoints: prepare/commit/abort idempotency and soft-reservations. |
+| `07_mode_flag.sh` | Switches `CHECKOUT_MODE` between saga and 2pc; verifies both work. |
+| `08_consistency_check.sh` | Concurrent checkouts; verifies stock and credit totals are consistent. |
+| `09_2pc_protocol.sh` | Exercises 2PC participant endpoints: prepare/commit/abort idempotency. |
 | `10_redis_aof_persistence.sh` | Crashes Redis masters and verifies data is restored on restart via AOF. |
+| `11_native_mq_2pc.sh` | Exercises 2PC participant endpoints over MQ: prepare/commit/abort idempotency. |
+| `12_microservices_pytest.sh` | Python unittest suite covering stock, payment, and order service correctness. |
+| `13_fault_mq_redis.sh` | Kills MQ Redis; verifies checkouts fail; restarts and verifies recovery + consistency. |
+| `14_fault_kill_process.sh` | Kills PID 1 inside service containers; verifies Docker restarts and checkouts recover. |
+| `15_fault_sequential_kills.sh` | Kills services one-by-one with recovery between each; verifies stock/credit consistency. |
 
 ## Technology Stack
 
@@ -202,4 +214,4 @@ Configuration is managed via environment variables in `docker-compose.yml` or K8
 | **Data Replication** | Redis Master + Replica + Sentinel |
 | **Serialization** | msgspec (msgpack binary format) |
 | **Load Balancer** | Nginx 1.25 with upstream health tracking |
-| **Reliability** | 2PC, Saga, Tombstones, WAL Recovery, Sentinel Failover |
+| **Reliability** | 2PC, Saga, Tombstones, Sentinel Failover |
