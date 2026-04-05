@@ -12,9 +12,6 @@ from rpc import submit_batch, recovery_rpc, task_ok, task_error
 
 log = logging.getLogger('order-service')
 
-
-# ── Task graph ─────────────────────────────────────────────────────────────────
-
 def _saga_tasks(order_id: str, order: OrderValue, tx_id: str) -> list:
     return [
         {
@@ -34,9 +31,6 @@ def _saga_tasks(order_id: str, order: OrderValue, tx_id: str) -> list:
         },
     ]
 
-
-# ── Checkout ───────────────────────────────────────────────────────────────────
-
 def checkout_saga(order_id: str) -> Response:
     order = get_order(order_id)
 
@@ -46,7 +40,6 @@ def checkout_saga(order_id: str) -> Response:
         abort(400, f"Order {order_id} is in state: {order.status}")
     # STATUS_FAILED orders can be retried (e.g. after adding stock/credit)
 
-    # Fresh transaction ID per attempt so tombstones don't block retries.
     try:
         attempt = wal.incr(f"{SAGA_ATTEMPT_PREFIX}{order_id}")
         tx_id = f"{order_id}_{attempt}"
@@ -85,16 +78,12 @@ def checkout_saga(order_id: str) -> Response:
 
     order.status = STATUS_FAILED
     try:
-        # Only remove from WAL if compensation succeeded; otherwise recovery will retry.
         save_order(order_id, order,
                    wal_remove=SAGA_PENDING_KEY if compensated else None)
     except redis.exceptions.RedisError:
         log.error("Failed to persist FAILED status for saga %s", order_id)
 
     abort(400, task_error(result, payment_id) or task_error(result, stock_id) or "Checkout failed")
-
-
-# ── Recovery ───────────────────────────────────────────────────────────────────
 
 def recover_saga():
     try:
@@ -125,7 +114,6 @@ def recover_saga():
                 wal.srem(SAGA_PENDING_KEY, order_id)
                 continue
 
-            # Read per-attempt tx_id from WAL store; fall back to order_id.
             raw_tx = wal.get(f"{SAGA_TX_PREFIX}{order_id}")
             tx_id = raw_tx.decode() if raw_tx else order_id
 

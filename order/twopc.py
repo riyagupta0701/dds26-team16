@@ -14,8 +14,6 @@ from rpc import submit_batch, recovery_rpc, task_ok, task_error
 log = logging.getLogger('order-service')
 
 
-# ── Task graphs ────────────────────────────────────────────────────────────────
-
 def _prepare_tasks(order_id: str, order: OrderValue) -> list:
     stock_p   = {'order_id': order_id, 'items': json.dumps(order.items)}
     payment_p = {'order_id': order_id, 'user_id': order.user_id,
@@ -40,23 +38,18 @@ def _commit_tasks(order_id: str, order: OrderValue) -> list:
     ]
 
 
-# ── Checkout ───────────────────────────────────────────────────────────────────
 
 def checkout_2pc(order_id: str) -> Response:
-    # ── WAL-before-act ─────────────────────────────────────────────────────────
-    # Write the WAL entry BEFORE committing STATUS_STARTED to db. This is the
-    # critical ordering: if we crash after the WAL write but before db.execute(),
-    # recovery finds the WAL entry, reads STATUS_PENDING (or missing) in db, and
-    # aborts cleanly. The reverse order (db first, WAL second) creates a window
-    # where the order is stuck in STATUS_STARTED with no WAL entry — recovery
-    # never finds it, and the next checkout attempt hits the STATUS_STARTED guard
-    # and returns 400 forever.
+    """Write the WAL entry BEFORE committing STATUS_STARTED to db. This is the
+    critical ordering: if we crash after the WAL write but before db.execute(),
+    recovery finds the WAL entry, reads STATUS_PENDING (or missing) in db, and
+    borts cleanly."""
+
     try:
         wal.sadd(COORD_PENDING_KEY, order_id)
     except redis.exceptions.RedisError:
         abort(500, DB_ERROR_STR)
 
-    # WATCH so only one gunicorn worker can claim a STATUS_PENDING order.
     try:
         with db.pipeline() as pipe:
             while True:
@@ -74,7 +67,6 @@ def checkout_2pc(order_id: str) -> Response:
                         return Response("Checkout successful", status=200)
                     if order.status == STATUS_STARTED:
                         pipe.reset()
-                        # WAL entry already existed (prior attempt) — leave it.
                         abort(400, f"Order {order_id} is in state: {order.status}")
                     # STATUS_FAILED orders can be retried (e.g. after adding stock/credit)
                     order.status = STATUS_STARTED
@@ -85,8 +77,6 @@ def checkout_2pc(order_id: str) -> Response:
                 except redis.WatchError:
                     continue
     except redis.exceptions.RedisError:
-        # db claim failed — remove the WAL entry we added above so we don't
-        # leave a ghost entry pointing at an order that never moved to STARTED.
         try:
             wal.srem(COORD_PENDING_KEY, order_id)
         except redis.exceptions.RedisError:
@@ -120,8 +110,6 @@ def checkout_2pc(order_id: str) -> Response:
 
     commit_result = submit_batch(f"2pc:commit:{order_id}", _commit_tasks(order_id, order))
 
-    # STATUS_PAID is durable — always return 200.
-    # If commit delivery failed, coordinator WAL keeps order_id; recover_2pc re-drives on restart.
     if commit_result is not None:
         stock_ok   = task_ok(commit_result, f"{order_id}:2pc:commit:stock")
         payment_ok = task_ok(commit_result, f"{order_id}:2pc:commit:payment")
@@ -153,8 +141,6 @@ def abort_2pc(order_id: str, order: OrderValue):
         except redis.exceptions.RedisError:
             log.warning("Could not remove %s from coordinator WAL", order_id)
 
-
-# ── Recovery ───────────────────────────────────────────────────────────────────
 
 def recover_2pc():
     try:

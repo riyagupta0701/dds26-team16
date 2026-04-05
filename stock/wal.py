@@ -1,6 +1,4 @@
 """
-wal.py — Decoupled Write-Ahead Log connection for the stock service.
-
 WAL entries stored here:
   wal:stock:2pc:{order_id}              → bytes  (prepared/committed/aborted)
 

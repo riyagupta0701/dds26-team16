@@ -1,6 +1,4 @@
 """
-wal.py — Decoupled Write-Ahead Log connection for the orchestrator service.
-
 All orchestrator WAL entries live in the shared wal-redis cluster, which is
 completely independent of the orchestrator containers and the MQ Redis.
 Killing both orchestrator-1 and orchestrator-2 does not touch wal-redis.
@@ -9,17 +7,6 @@ Key namespace (all prefixed wal:orch: to avoid collisions with service WALs):
   wal:orch:pending               → Redis Set  (batch_ids currently in-flight)
   wal:orch:batch:{batch_id}      → String     (JSON snapshot of full batch state)
   wal:orch:lock:{batch_id}       → String/TTL (recovery mutex, expires in 30s)
-
-Design:
-  - _persist_batch() is the only write path for batch state. It is always called
-    BEFORE dispatching tasks (pre-write) and AFTER each wave (post-write), so
-    the WAL always reflects at least what has been attempted, never what hasn't.
-  - wal:orch:pending is written atomically with the first _persist_batch() call
-    so recovery can find batches even if the orchestrator crashes before the
-    listener loop acks the message.
-  - On completion/failure, wal:orch:pending entry is removed and the batch JSON
-    is updated with the final status. The JSON is kept (not deleted) for a short
-    TTL so callers can inspect it post-completion if needed.
 """
 
 import json
@@ -32,7 +19,6 @@ from redis.backoff import NoBackoff
 
 logger = logging.getLogger(__name__)
 
-# ── Key helpers ────────────────────────────────────────────────────────────────
 
 PENDING_KEY = 'wal:orch:pending'
 
@@ -43,9 +29,6 @@ def _batch_key(batch_id: str) -> str:
 
 def _lock_key(batch_id: str) -> str:
     return f'wal:orch:lock:{batch_id}'
-
-
-# ── Connection ─────────────────────────────────────────────────────────────────
 
 def _build_wal_connection() -> redis.Redis:
     password = os.environ.get('WAL_REDIS_PASSWORD', '')
@@ -83,17 +66,13 @@ def _build_wal_connection() -> redis.Redis:
     )
 
 
-# Module-level WAL connection — shared across all threads in this process.
 wal: redis.Redis = _build_wal_connection()
 
-
-# ── WAL operations ─────────────────────────────────────────────────────────────
 
 def persist_batch(batch: dict) -> None:
     """
     Append-write the current batch state to wal-redis.
     Also ensures batch_id is in the wal:orch:pending set.
-    Called before dispatching any tasks (pre-write) and after every wave.
     """
     batch_id = batch['batch_id']
     try:
@@ -107,7 +86,6 @@ def persist_batch(batch: dict) -> None:
 
 
 def load_batch(batch_id: str) -> dict | None:
-    """Read the last persisted snapshot of a batch. Returns None if not found."""
     try:
         raw = wal.get(_batch_key(batch_id))
         return json.loads(raw) if raw else None
@@ -120,7 +98,6 @@ def complete_batch(batch: dict) -> None:
     """
     Mark batch as complete in the WAL: update the JSON snapshot and remove
     from the pending set so recovery ignores it.
-    Sets a 24-hour TTL on the batch key so the record is not kept forever.
     """
     batch_id = batch['batch_id']
     try:
@@ -130,12 +107,9 @@ def complete_batch(batch: dict) -> None:
         pipe.execute()
     except redis.exceptions.RedisError as exc:
         logger.error('WAL complete_batch %s failed: %s', batch_id, exc)
-        # Non-fatal: recovery will find the batch still in wal:orch:pending
-        # and re-drive it (idempotent), then clean up.
 
 
 def acquire_lock(batch_id: str, ttl_s: int = 30) -> bool:
-    """Acquire a recovery lock for batch_id. Returns True if acquired."""
     try:
         return bool(wal.set(_lock_key(batch_id), 'locked', nx=True, ex=ttl_s))
     except redis.exceptions.RedisError:
@@ -143,7 +117,6 @@ def acquire_lock(batch_id: str, ttl_s: int = 30) -> bool:
 
 
 def release_lock(batch_id: str) -> None:
-    """Release the recovery lock for batch_id."""
     try:
         wal.delete(_lock_key(batch_id))
     except redis.exceptions.RedisError:
@@ -151,7 +124,6 @@ def release_lock(batch_id: str) -> None:
 
 
 def pending_batch_ids() -> list[str]:
-    """Return all batch_ids currently in wal:orch:pending."""
     try:
         return [b.decode() for b in wal.smembers(PENDING_KEY)]
     except redis.exceptions.RedisError as exc:
@@ -160,7 +132,6 @@ def pending_batch_ids() -> list[str]:
 
 
 def remove_from_pending(batch_id: str) -> None:
-    """Remove a batch_id from the pending set without touching the batch JSON."""
     try:
         wal.srem(PENDING_KEY, batch_id)
     except redis.exceptions.RedisError as exc:

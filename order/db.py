@@ -11,11 +11,8 @@ STATUS_PAID    = "paid"
 STATUS_FAILED  = "failed"
 
 # WAL keys now live in wal-redis (imported from wal.py).
-# These names are kept here as aliases so the rest of the codebase
-# can import them from db without touching their call sites.
 from wal import COORD_PENDING_KEY, SAGA_PENDING_KEY  # noqa: E402
 
-# ── Connections ────────────────────────────────────────────────────────────────
 _REDIS_PASSWORD    = os.environ.get('REDIS_PASSWORD', '')
 _REDIS_DB          = int(os.environ.get('REDIS_DB', '0'))
 _SENTINEL_HOSTS    = os.environ.get('REDIS_SENTINEL_HOSTS', '')
@@ -52,7 +49,6 @@ mq: redis.Redis = redis.Redis(
     db=int(os.environ['MQ_REDIS_DB']),
 )
 
-# ── Model ──────────────────────────────────────────────────────────────────────
 class OrderValue(Struct, kw_only=True):
     paid: bool
     items: dict[str, int]
@@ -60,7 +56,6 @@ class OrderValue(Struct, kw_only=True):
     total_cost: int
     status: str = STATUS_PENDING
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
 def get_order(order_id: str) -> OrderValue:
     try:
         raw = db.get(order_id)
@@ -84,25 +79,19 @@ def save_order(order_id: str, order: OrderValue, *,
     """
     from wal import wal as _wal
 
-    # Step 1: write WAL entry before touching db
     try:
         if wal_add:
             _wal.sadd(wal_add, order_id)
     except redis.exceptions.RedisError:
-        raise  # cannot proceed without a WAL entry
+        raise
 
-    # Step 2: persist business data
     try:
         db.set(order_id, msgpack.encode(order))
     except redis.exceptions.RedisError:
-        # db write failed — the WAL entry we just added is an orphan.
-        # Recovery will find it, read STATUS_PENDING (unchanged) or a missing
-        # order in db, and clean up safely. Re-raise so the caller aborts.
         raise
 
-    # Step 3: best-effort WAL cleanup
     if wal_remove:
         try:
             _wal.srem(wal_remove, order_id)
         except redis.exceptions.RedisError:
-            pass  # non-fatal: recovery will clean up on next startup
+            pass

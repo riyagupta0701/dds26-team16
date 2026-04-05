@@ -21,7 +21,6 @@ from twopc import checkout_2pc, recover_2pc
 app = Flask("order-service")
 atexit.register(lambda: (db.close(), mq.close(), wal.close()))
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
@@ -131,8 +130,6 @@ def health_check():
         return jsonify({"status": "unhealthy"}), 500
 
 
-# ── Startup recovery ───────────────────────────────────────────────────────────
-
 def _run_recovery():
     time.sleep(5)
     try:
@@ -146,8 +143,6 @@ def start_background_recovery():
     app.logger.info("Worker %d starting background recovery", os.getpid())
     threading.Thread(target=_run_recovery, daemon=True).start()
 
-
-# ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     start_background_recovery()

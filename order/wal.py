@@ -13,7 +13,6 @@ import redis
 from redis.retry import Retry
 from redis.backoff import NoBackoff
 
-# ── WAL key constants ──────────────────────────────────────────────────────────
 SAGA_PENDING_KEY  = "wal:order:saga:pending"
 COORD_PENDING_KEY = "wal:order:2pc:pending"
 
@@ -57,5 +56,4 @@ def _build_wal_connection() -> redis.Redis:
     )
 
 
-# Module-level WAL connection — one per gunicorn worker process.
 wal: redis.Redis = _build_wal_connection()

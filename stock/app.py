@@ -15,7 +15,7 @@ from wal import wal, _stock_wal_key
 
 DB_ERROR_STR = "DB error"
 
-# 2PC WAL state values stored in wal-redis (decoupled from business data)
+# 2PC WAL state values stored in wal-redis
 WAL_PREPARED  = b"prepared"
 WAL_COMMITTED = b"committed"
 WAL_ABORTED   = b"aborted"
@@ -58,7 +58,6 @@ else:
     )
 
 # Separate connection for Message Queue operations
-# Defaults to the same host as DB, but allows splitting in production
 mq: redis.Redis = redis.Redis(host=os.environ['MQ_REDIS_HOST'],
                               port=int(os.environ['MQ_REDIS_PORT']),
                               password=os.environ['MQ_REDIS_PASSWORD'],
@@ -77,7 +76,6 @@ class StockValue(Struct):
     stock: int
     price: int
 
-# ─── Logic Helpers ────────────────────────────────────────────────────────────
 
 def response_success(body, status_code=200):
     return {"status_code": status_code, "body": body}
@@ -192,7 +190,6 @@ def remove_stock_logic(item_id: str, amount: int):
 def add_stock_batch_logic(items_json: str, transaction_id: str | None = None):
     """
     Atomically add stock for multiple items.
-    payload: {'items': '{"item_id": amount, ...}'}
     """
     try:
         items: dict[str, int] = json.loads(items_json)
@@ -216,8 +213,6 @@ def add_stock_batch_logic(items_json: str, transaction_id: str | None = None):
                         pipe.unwatch()
                         return response_success("Rollback already processed (idempotent)")
                     else:
-                        # Key does not exist (or unknown state). 
-                        # Set Tombstone to prevent future deductions.
                         pipe.multi()
                         pipe.set(tx_key, TX_ROLLED_BACK)
                         pipe.execute()
@@ -315,16 +310,9 @@ def subtract_stock_batch_logic(items_json: str, transaction_id: str | None = Non
     return response_error("Conflict: could not subtract stock batch after retries")
 
 
-# ─── 2PC Participant Endpoints ─────────────────────────────────────────────────
-#
-# Soft-reservations are stored as plain Redis integers under:
-#   reserved:stock:{item_id}
-#
-# Per-transaction WAL entries live under:
-#   2pc:stock:{order_id}:{item_id}  → b"prepared" | b"committed" | b"aborted"
-#
-# All three endpoints use WATCH/MULTI/EXEC for optimistic concurrency control so
-# multiple gunicorn workers never corrupt each other's reads and writes.
+# 2PC Participant Endpoints
+# Per-transaction WAL entries: 2pc:stock:{order_id}:{item_id}  → b"prepared" | b"committed" | b"aborted"
+# All three endpoints use WATCH/MULTI/EXEC for optimistic concurrency control
 
 def _stock_reserved_key(item_id: str) -> str:
     return f"reserved:stock:{item_id}"
@@ -332,9 +320,6 @@ def _stock_reserved_key(item_id: str) -> str:
 def prepare_subtract_batch_logic(order_id: str, items_json: str):
     """
     2PC Phase 1 - PREPARE BATCH (participant: stock).
-    WAL state (prepared/committed/aborted) lives in the decoupled wal-redis.
-    Soft-reservations stay in db-redis alongside stock values so they can
-    be checked atomically in a single WATCH/MULTI/EXEC pipeline.
     """
     try:
         items: dict[str, int] = json.loads(items_json)
@@ -396,8 +381,6 @@ def prepare_subtract_batch_logic(order_id: str, items_json: str):
         wal.set(wal_key, WAL_PREPARED)
     except redis.exceptions.RedisError:
         # WAL write failed — roll back the soft-reserve we just applied.
-        # Use a proper WATCH/MULTI/EXEC so the rollback is atomic and another
-        # writer cannot corrupt the reservation counter between our read and write.
         for _ in range(5):
             try:
                 with db.pipeline() as pipe:
@@ -478,7 +461,7 @@ def commit_subtract_batch_logic(order_id: str, items_json: str):
     else:
         return response_error("Conflict: could not commit batch after retries")
 
-    # Write WAL committed (wal-redis) — non-fatal if it fails
+    # Write WAL committed (wal-redis)
     try:
         wal.set(wal_key, WAL_COMMITTED)
     except redis.exceptions.RedisError:
@@ -546,7 +529,6 @@ def abort_subtract_batch_logic(order_id: str, items_json: str):
 
     return response_success("Abort batch: OK")
 
-# ─── Flask Routes (Wrappers) ──────────────────────────────────────────────────
 
 @app.post('/item/create/<price>')
 def create_item(price: int):
@@ -583,7 +565,6 @@ def health_check():
         app.logger.error(f"Health check failed: {e}")
         return jsonify({"status": "unhealthy", "db": "disconnected", "mq": "disconnected"}), 500
 
-# ─── Message Queue Listener ───────────────────────────────────────────────────
 
 def run_event_listener():
     stream_key = 'events:stock'
@@ -648,7 +629,6 @@ def run_event_listener():
 
                     except Exception as e:
                         app.logger.error(f"Error processing MQ message {message_id}: {e}")
-                        # Optionally we could push an error response to reply_to here
                         if reply_to:
                              error_res = response_error(f"Internal processing error: {str(e)}", 500)
                              mq.rpush(reply_to, json.dumps(error_res))
@@ -656,10 +636,9 @@ def run_event_listener():
 
         except Exception as e:
             app.logger.error(f"MQ Listener loop error: {e}")
-            time.sleep(2) # Backoff
+            time.sleep(2)
 
 if __name__ == '__main__':
-    # Start background listener thread
     t = threading.Thread(target=run_event_listener, daemon=True)
     t.start()
     app.run(host="0.0.0.0", port=8000, debug=True)
@@ -668,6 +647,5 @@ else:
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
     
-    # Start background listener thread when running with Gunicorn
     t = threading.Thread(target=run_event_listener, daemon=True)
     t.start()

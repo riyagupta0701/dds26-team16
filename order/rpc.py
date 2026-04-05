@@ -61,7 +61,6 @@ def submit_batch(batch_id: str, tasks: list, timeout: int = 60) -> dict | None:
 
 
 def recovery_rpc(stream: str, action: str, data: dict) -> bool:
-    """Best-effort RPC. Returns True only on a 200 response."""
     resp = send_rpc(stream, action, data)
     return bool(resp and resp.status_code == 200)
 
