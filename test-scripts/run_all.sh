@@ -63,21 +63,53 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
-# Core correctness tests (fast, no container killing)
+# Core correctness tests in SAGA mode (default)
+echo ""
+echo -e "${BOLD}── Saga mode (default) ──${RESET}"
 run_test "$SCRIPT_DIR/01_happy_path.sh"
 run_test "$SCRIPT_DIR/02_idempotency.sh"
 run_test "$SCRIPT_DIR/03_compensation_payment_fails.sh"
 run_test "$SCRIPT_DIR/04_compensation_stock_fails.sh"
 run_test "$SCRIPT_DIR/08_consistency_check.sh"
 
+# Switch to 2PC and re-run core correctness tests
+echo ""
+echo -e "${BOLD}── Switching to 2PC mode ──${RESET}"
+curl -s -X POST "$BASE_URL/orders/mode/2pc" > /dev/null
+echo -e "${GREEN}✔  Mode set to 2pc${RESET}"
+
+run_test "$SCRIPT_DIR/01_happy_path.sh"
+run_test "$SCRIPT_DIR/02_idempotency.sh"
+run_test "$SCRIPT_DIR/03_compensation_payment_fails.sh"
+run_test "$SCRIPT_DIR/04_compensation_stock_fails.sh"
+run_test "$SCRIPT_DIR/08_consistency_check.sh"
+
+# Restore saga mode
+echo ""
+echo -e "${BOLD}── Restoring saga mode ──${RESET}"
+curl -s -X POST "$BASE_URL/orders/mode/saga" > /dev/null
+echo -e "${GREEN}✔  Mode set to saga${RESET}"
+
 # 2PC participant protocol (no container restart required)
+run_test "$SCRIPT_DIR/09_2pc_protocol.sh"
 run_test "$SCRIPT_DIR/11_native_mq_2pc.sh"
+
+# Python integration tests (requires pytest + requests)
+if command -v python &> /dev/null && python -c "import pytest" 2>/dev/null; then
+  run_test "$SCRIPT_DIR/12_microservices_pytest.sh"
+else
+  echo ""
+  echo -e "${YELLOW}→  Skipping pytest tests (python/pytest not available)${RESET}"
+fi
 
 # Fault tolerance tests (stop/start containers — slower)
 if [ "${SKIP_FAULT_TESTS:-0}" != "1" ]; then
   run_test "$SCRIPT_DIR/05_fault_app_replica.sh"
   run_test "$SCRIPT_DIR/06_fault_redis_master.sh"
   run_test "$SCRIPT_DIR/10_redis_aof_persistence.sh"
+  run_test "$SCRIPT_DIR/13_fault_mq_redis.sh"
+  run_test "$SCRIPT_DIR/14_fault_kill_process.sh"
+  run_test "$SCRIPT_DIR/15_fault_sequential_kills.sh"
 else
   echo ""
   echo -e "${YELLOW}→  Skipping fault tests (SKIP_FAULT_TESTS=1)${RESET}"
