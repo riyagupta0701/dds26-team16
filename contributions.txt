@@ -1,8 +1,7 @@
 Contributions
 
 
-Atharva Dagaonkar
-Role: 2PC Lead
+Atharva Dagaonkar (6406947) a.m.dagaonkar@student.tudelft.nl
 
 - Authored task-split.md and project design documents
 - Implemented 2PC coordinator in order/app.py: checkout_2pc(), _abort_2pc(), recover_2pc()
@@ -13,30 +12,34 @@ Role: 2PC Lead
 - Added concurrent worker guard preventing two gunicorn workers from double-claiming the same order
 - Fixed soft-reservation guards to reject deductions below reserved amounts
 - Wrote 2PC test scripts: mode-switching (07_mode_flag.sh) and end-to-end protocol tests (09_2pc_protocol.sh)
+- Implemented the Orchestrator Service with retry logic and extensive test suite
+- Modularised order service into separate SAGA, 2PC, RPC and DB files
 
 
-Pranav Gupta
-Role: Architecture & Fault Tolerance
+Pranav Gupta (6499856) pranavgupta@tudelft.nl
 
 - Implemented overall system fault tolerance on the software side.
 - Redesigned the microservices architecture from REST HTTPS-based communication to an "asynchronous" Message Queue (Redis Streams) model.
 - Decoupled State and Messaging layers by implementing independent MQ connection pools with dedicated environment variables.
 - Developed enhanced `/health` endpoints for all microservices to verify both Database and MQ readiness.
 - Implemented synchronous and transactional Saga/2PC recovery logic to ensure consistent state after service crashes.
+- Reviewed multiple PRs in this phase 2 of the project
+- Implemented the retry logic for orchestrator (order retry after failure)
 
 
-Riya Gupta
-Role: Saga Protocol, Docker Infrastructure
+Riya Gupta (6452272), r.gupta-8@student.tudelft.nl
 
 - Implemented the Saga orchestration protocol
 - Upgraded Docker Compose from single-node Redis to a master/replica setup per service and updated `gateway_nginx.conf` for zero-downtime failover with `max_fails`, `proxy_next_upstream`, and keepalive tuning
 - Wrote test scripts (1-5, 7-8, run_all.sh, helpers.sh) covering happy path, idempotency, Saga compensation, app replica fault tolerance, mode switching, and concurrent consistency checks
 - Ran the benchmark against the Docker deployment
+- Decoupled Write-Ahead Logs from all service containers into a shared wal-redis cluster after the orchestrator service implementation
 
 
-Jimmy Oei
-Role: Architect
+Jimmy Oei (6540031), J.T.Oei-1@student.tudelft.nl
 
 - Designed and Implemented the Kubernetes deployment architecture
 - Wrote test scripts 6, 11-14, and the kubernetes parts of each test
 - Wrote and fixed test scripts: 06_fault_redis_master.sh (Sentinel failover), 10_redis_aof_persistence.sh (AOF persistence)
+- Designed the docker compose architectures: small, medium, and large for both vanilla and orchestrator branches
+- Added final fault tolerance tests: 12-15 in vanilla, and 15-19 in orchestrator branch
