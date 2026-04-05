@@ -1,6 +1,6 @@
-# Distributed Web Shop — DDS26 Team 16
+# DDS26 - Team 16
 
-A fault-tolerant, distributed e-commerce backend built with Flask microservices, Redis, and Nginx. This architecture utilizes **Event-Driven Inter-Service Communication** via Redis Streams, supporting both **Saga (orchestration)** and **Two-Phase Commit (2PC)** protocols.
+A fault-tolerant, distributed e-commerce backend built with Flask microservices, Redis, and Nginx. This architecture utilizes Event-Driven Inter-Service Communication via Redis Streams, supporting both Saga (orchestration) and Two-Phase Commit (2PC) protocols.
 
 ## Table of Contents
 
@@ -117,9 +117,9 @@ Three compose files are provided targeting different CPU budgets, plus a general
 #### Testing - general docker compose setup
 Docker compose setup that is similar to "medium" and "large" configuration but with fewer resources such that it can be run on our laptops for testing.
 
-**Prerequisites:** For the tests you need to install pytest and requests:
+**Prerequisites:** You need to install the defined requirements:
 ```bash
-pip install pytest requests
+pip install -r requirements.txt
 ```
 
 **Run tests** (using the default `docker-compose.yml`):
@@ -172,7 +172,7 @@ Configuration is managed via environment variables in `docker-compose.yml`.
 
 ## Testing Suite
 
-**Prerequisites:** `pip install pytest requests`
+**Prerequisites:** `pip install -r requirements.txt`
 
 The test suite runs core correctness tests (01–04, 08) in **both saga and 2pc modes**. It switches modes at runtime via the `/orders/mode/<mode>` API — no restart needed. Fault tolerance tests run in saga mode (the default), since the infrastructure-level fault handling (nginx failover, Sentinel, container restart) is mode-agnostic.
 
