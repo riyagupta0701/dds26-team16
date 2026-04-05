@@ -16,7 +16,7 @@ Atharva Dagaonkar (6406947) a.m.dagaonkar@student.tudelft.nl
 - Modularised order service into separate SAGA, 2PC, RPC and DB files
 
 
-Pranav Gupta
+Pranav Gupta (6499856) pranavgupta@tudelft.nl
 
 - Implemented overall system fault tolerance on the software side.
 - Redesigned the microservices architecture from REST HTTPS-based communication to an "asynchronous" Message Queue (Redis Streams) model.
