@@ -66,12 +66,32 @@ done
 # Python integration tests (pytest)
 run_test "$SCRIPT_DIR/13_microservices_pytest.sh"
 
-# Core correctness tests (fast, no container killing)
+# Core correctness tests in SAGA mode (default)
+echo ""
+echo -e "${BOLD}── Saga mode (default) ──${RESET}"
 run_test "$SCRIPT_DIR/01_happy_path.sh"
 run_test "$SCRIPT_DIR/02_idempotency.sh"
 run_test "$SCRIPT_DIR/03_compensation_payment_fails.sh"
 run_test "$SCRIPT_DIR/04_compensation_stock_fails.sh"
 run_test "$SCRIPT_DIR/08_consistency_check.sh"
+
+# Switch to 2PC and re-run core correctness tests
+echo ""
+echo -e "${BOLD}── Switching to 2PC mode ──${RESET}"
+curl -s -X POST "$BASE_URL/orders/mode/2pc" > /dev/null
+echo -e "${GREEN}✔  Mode set to 2pc${RESET}"
+
+run_test "$SCRIPT_DIR/01_happy_path.sh"
+run_test "$SCRIPT_DIR/02_idempotency.sh"
+run_test "$SCRIPT_DIR/03_compensation_payment_fails.sh"
+run_test "$SCRIPT_DIR/04_compensation_stock_fails.sh"
+run_test "$SCRIPT_DIR/08_consistency_check.sh"
+
+# Restore saga mode
+echo ""
+echo -e "${BOLD}── Restoring saga mode ──${RESET}"
+curl -s -X POST "$BASE_URL/orders/mode/saga" > /dev/null
+echo -e "${GREEN}✔  Mode set to saga${RESET}"
 
 # 2PC participant protocol (no container restart required)
 run_test "$SCRIPT_DIR/09_2pc_protocol.sh"
@@ -83,6 +103,11 @@ if [ "${SKIP_FAULT_TESTS:-0}" != "1" ]; then
   run_test "$SCRIPT_DIR/06_fault_redis_master.sh"
   run_test "$SCRIPT_DIR/10_redis_aof_persistence.sh"
   run_test "$SCRIPT_DIR/14_wal_decoupled.sh"
+  run_test "$SCRIPT_DIR/15_fault_wal_redis_master.sh"
+  run_test "$SCRIPT_DIR/16_fault_mq_redis.sh"
+  run_test "$SCRIPT_DIR/17_fault_kill_process.sh"
+  run_test "$SCRIPT_DIR/18_fault_sequential_kills.sh"
+  run_test "$SCRIPT_DIR/19_fault_orchestrator_under_load.sh"
 else
   echo ""
   echo -e "${YELLOW}→  Skipping fault tests (SKIP_FAULT_TESTS=1)${RESET}"

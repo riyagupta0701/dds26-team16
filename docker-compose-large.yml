@@ -6,15 +6,15 @@
 ##   orchestrator        ×4 (1.5 each): 6.0
 ##   wal-redis-master:                  1.0
 ##   wal-redis-replica:                 0.5
-##   wal-redis-sentinel:                0.1
-##   order-service       ×8 (3.1 each): 24.8
-##   stock-service       ×8 (3.1 each): 24.8
-##   payment-service     ×8 (3.1 each): 24.8
+##   wal-redis-sentinels ×3 (0.1 each): 0.3
+##   order-service       ×8 (3.0 each): 24.0
+##   stock-service       ×8 (3.0 each): 24.0
+##   payment-service     ×8 (3.0 each): 24.0
 ##   3× redis masters    (1.0 each):    3.0
 ##   3× redis replicas   (0.5 each):    1.5
-##   3× redis sentinels  (0.1 each):    0.3
+##   3× redis sentinels  ×3 (0.1 each): 0.9
 ##   ────────────────────────────────────────
-##   Total = 89.8 CPUs  (hard limit ≤ 90)
+##   Total = 88.2 CPUs  (hard limit ≤ 90)
 
 services:
   # ── MESSAGE QUEUE BROKER ──────────────────────────────────────────────────
@@ -109,12 +109,12 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  wal-redis-sentinel:
+  wal-redis-sentinel-1: &wal-sentinel
     image: redis:7.2-bookworm
     command: >
       sh -c "
         echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
-        echo 'sentinel monitor wal-master wal-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel monitor wal-master wal-redis-master 6379 2' >> /tmp/sentinel.conf &&
         echo 'sentinel auth-pass wal-master redis' >> /tmp/sentinel.conf &&
         echo 'sentinel down-after-milliseconds wal-master 5000' >> /tmp/sentinel.conf &&
         echo 'sentinel failover-timeout wal-master 10000' >> /tmp/sentinel.conf &&
@@ -136,6 +136,12 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  wal-redis-sentinel-2:
+    <<: *wal-sentinel
+
+  wal-redis-sentinel-3:
+    <<: *wal-sentinel
+
   # ── ORCHESTRATOR (4 replicas) ─────────────────────────────────────────────
   orchestrator-1: &orchestrator-service
     build: ./orchestrator
@@ -149,7 +155,7 @@ services:
       - WAL_REDIS_PORT=6379
       - WAL_REDIS_PASSWORD=redis
       - WAL_REDIS_DB=0
-      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel-1:26379,wal-redis-sentinel-2:26379,wal-redis-sentinel-3:26379
       - WAL_MASTER_NAME=wal-master
       - ORCH_MAX_RETRIES=3
       - ORCH_TASK_TIMEOUT_S=5
@@ -162,7 +168,7 @@ services:
     depends_on:
       mq-redis:
         condition: service_healthy
-      wal-redis-sentinel:
+      wal-redis-sentinel-1:
         condition: service_healthy
     restart: unless-stopped
 
@@ -177,7 +183,7 @@ services:
       - WAL_REDIS_PORT=6379
       - WAL_REDIS_PASSWORD=redis
       - WAL_REDIS_DB=0
-      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel-1:26379,wal-redis-sentinel-2:26379,wal-redis-sentinel-3:26379
       - WAL_MASTER_NAME=wal-master
       - ORCH_MAX_RETRIES=3
       - ORCH_TASK_TIMEOUT_S=5
@@ -193,7 +199,7 @@ services:
       - WAL_REDIS_PORT=6379
       - WAL_REDIS_PASSWORD=redis
       - WAL_REDIS_DB=0
-      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel-1:26379,wal-redis-sentinel-2:26379,wal-redis-sentinel-3:26379
       - WAL_MASTER_NAME=wal-master
       - ORCH_MAX_RETRIES=3
       - ORCH_TASK_TIMEOUT_S=5
@@ -209,7 +215,7 @@ services:
       - WAL_REDIS_PORT=6379
       - WAL_REDIS_PASSWORD=redis
       - WAL_REDIS_DB=0
-      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel-1:26379,wal-redis-sentinel-2:26379,wal-redis-sentinel-3:26379
       - WAL_MASTER_NAME=wal-master
       - ORCH_MAX_RETRIES=3
       - ORCH_TASK_TIMEOUT_S=5
@@ -230,26 +236,26 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
       - REDIS_DB=0
-      - REDIS_SENTINEL_HOSTS=order-redis-sentinel:26379
+      - REDIS_SENTINEL_HOSTS=order-redis-sentinel-1:26379,order-redis-sentinel-2:26379,order-redis-sentinel-3:26379
       - REDIS_MASTER_NAME=order-master
       - WAL_REDIS_HOST=wal-redis-master
       - WAL_REDIS_PORT=6379
       - WAL_REDIS_PASSWORD=redis
       - WAL_REDIS_DB=0
-      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel-1:26379,wal-redis-sentinel-2:26379,wal-redis-sentinel-3:26379
       - WAL_MASTER_NAME=wal-master
     command: gunicorn -b 0.0.0.0:5000 -w 8 --timeout 70 --log-level=info app:app
     deploy:
       resources:
         limits:
-          cpus: "3.1"
+          cpus: "3.0"
           memory: 512M
     depends_on:
       mq-redis:
         condition: service_healthy
-      order-redis-sentinel:
+      order-redis-sentinel-1:
         condition: service_healthy
-      wal-redis-sentinel:
+      wal-redis-sentinel-1:
         condition: service_healthy
     restart: unless-stopped
 
@@ -310,12 +316,12 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  order-redis-sentinel:
+  order-redis-sentinel-1: &order-sentinel
     image: redis:7.2-bookworm
     command: >
       sh -c "
         echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
-        echo 'sentinel monitor order-master order-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel monitor order-master order-redis-master 6379 2' >> /tmp/sentinel.conf &&
         echo 'sentinel auth-pass order-master redis' >> /tmp/sentinel.conf &&
         echo 'sentinel down-after-milliseconds order-master 5000' >> /tmp/sentinel.conf &&
         echo 'sentinel failover-timeout order-master 10000' >> /tmp/sentinel.conf &&
@@ -337,6 +343,12 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  order-redis-sentinel-2:
+    <<: *order-sentinel
+
+  order-redis-sentinel-3:
+    <<: *order-sentinel
+
   # ── STOCK SERVICE (8 replicas × 8 workers) ───────────────────────────────
   stock-service-1: &stock-service
     build: ./stock
@@ -350,26 +362,26 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
       - REDIS_DB=0
-      - REDIS_SENTINEL_HOSTS=stock-redis-sentinel:26379
+      - REDIS_SENTINEL_HOSTS=stock-redis-sentinel-1:26379,stock-redis-sentinel-2:26379,stock-redis-sentinel-3:26379
       - REDIS_MASTER_NAME=stock-master
       - WAL_REDIS_HOST=wal-redis-master
       - WAL_REDIS_PORT=6379
       - WAL_REDIS_PASSWORD=redis
       - WAL_REDIS_DB=0
-      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel-1:26379,wal-redis-sentinel-2:26379,wal-redis-sentinel-3:26379
       - WAL_MASTER_NAME=wal-master
     command: gunicorn -b 0.0.0.0:5000 -w 8 --timeout 30 --log-level=info app:app
     deploy:
       resources:
         limits:
-          cpus: "3.1"
+          cpus: "3.0"
           memory: 512M
     depends_on:
       mq-redis:
         condition: service_healthy
-      stock-redis-sentinel:
+      stock-redis-sentinel-1:
         condition: service_healthy
-      wal-redis-sentinel:
+      wal-redis-sentinel-1:
         condition: service_healthy
     restart: unless-stopped
 
@@ -430,12 +442,12 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  stock-redis-sentinel:
+  stock-redis-sentinel-1: &stock-sentinel
     image: redis:7.2-bookworm
     command: >
       sh -c "
         echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
-        echo 'sentinel monitor stock-master stock-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel monitor stock-master stock-redis-master 6379 2' >> /tmp/sentinel.conf &&
         echo 'sentinel auth-pass stock-master redis' >> /tmp/sentinel.conf &&
         echo 'sentinel down-after-milliseconds stock-master 5000' >> /tmp/sentinel.conf &&
         echo 'sentinel failover-timeout stock-master 10000' >> /tmp/sentinel.conf &&
@@ -457,6 +469,12 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  stock-redis-sentinel-2:
+    <<: *stock-sentinel
+
+  stock-redis-sentinel-3:
+    <<: *stock-sentinel
+
   # ── PAYMENT SERVICE (8 replicas × 8 workers) ─────────────────────────────
   payment-service-1: &payment-service
     build: ./payment
@@ -470,26 +488,26 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=redis
       - REDIS_DB=0
-      - REDIS_SENTINEL_HOSTS=payment-redis-sentinel:26379
+      - REDIS_SENTINEL_HOSTS=payment-redis-sentinel-1:26379,payment-redis-sentinel-2:26379,payment-redis-sentinel-3:26379
       - REDIS_MASTER_NAME=payment-master
       - WAL_REDIS_HOST=wal-redis-master
       - WAL_REDIS_PORT=6379
       - WAL_REDIS_PASSWORD=redis
       - WAL_REDIS_DB=0
-      - WAL_SENTINEL_HOSTS=wal-redis-sentinel:26379
+      - WAL_SENTINEL_HOSTS=wal-redis-sentinel-1:26379,wal-redis-sentinel-2:26379,wal-redis-sentinel-3:26379
       - WAL_MASTER_NAME=wal-master
     command: gunicorn -b 0.0.0.0:5000 -w 8 --timeout 30 --log-level=info app:app
     deploy:
       resources:
         limits:
-          cpus: "3.1"
+          cpus: "3.0"
           memory: 512M
     depends_on:
       mq-redis:
         condition: service_healthy
-      payment-redis-sentinel:
+      payment-redis-sentinel-1:
         condition: service_healthy
-      wal-redis-sentinel:
+      wal-redis-sentinel-1:
         condition: service_healthy
     restart: unless-stopped
 
@@ -550,12 +568,12 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  payment-redis-sentinel:
+  payment-redis-sentinel-1: &payment-sentinel
     image: redis:7.2-bookworm
     command: >
       sh -c "
         echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
-        echo 'sentinel monitor payment-master payment-redis-master 6379 1' >> /tmp/sentinel.conf &&
+        echo 'sentinel monitor payment-master payment-redis-master 6379 2' >> /tmp/sentinel.conf &&
         echo 'sentinel auth-pass payment-master redis' >> /tmp/sentinel.conf &&
         echo 'sentinel down-after-milliseconds payment-master 5000' >> /tmp/sentinel.conf &&
         echo 'sentinel failover-timeout payment-master 10000' >> /tmp/sentinel.conf &&
@@ -576,6 +594,12 @@ services:
       payment-redis-master:
         condition: service_healthy
     restart: unless-stopped
+
+  payment-redis-sentinel-2:
+    <<: *payment-sentinel
+
+  payment-redis-sentinel-3:
+    <<: *payment-sentinel
 
 volumes:
   wal-master-data:

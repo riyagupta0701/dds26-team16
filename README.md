@@ -11,7 +11,6 @@ A fault-tolerant, distributed e-commerce backend built with Flask microservices,
 5. [API Reference](#api-reference)
 6. [Getting Started](#getting-started)
    - [Docker Compose](#docker-compose)
-   - [Kubernetes — minikube](#kubernetes--minikube-local)
 7. [Configuration](#configuration)
 8. [Testing](#testing)
 9. [Technology Stack](#technology-stack)
@@ -51,7 +50,7 @@ A fault-tolerant, distributed e-commerce backend built with Flask microservices,
               └─────────────────────────┘
 ```
 
-The system is composed of three logical services (Order, Stock, Payment) and an **Orchestrator** that coordinates multi-service transactions. Each service runs as **2 application replicas** behind a shared Nginx upstream pool. For data persistence and high availability, each of the three business services has its own isolated **Redis master + replica + Sentinel** cluster. The orchestrator persists its WAL state to the shared **WAL Redis** cluster and uses the shared MQ Redis for messaging — it does not have a separate Redis cluster. A shared **WAL Redis** cluster (master + replica + Sentinel) stores all Write-Ahead Log entries independently of every service's business data. The complete stack totals **22 containers**.
+The system is composed of three logical services (Order, Stock, Payment) and an **Orchestrator** that coordinates multi-service transactions. Each service runs as **2 application replicas** behind a shared Nginx upstream pool. For data persistence and high availability, each of the three business services has its own isolated **Redis master + replica + 3-node Sentinel** cluster. The orchestrator persists its WAL state to the shared **WAL Redis** cluster and uses the shared MQ Redis for messaging — it does not have a separate Redis cluster. A shared **WAL Redis** cluster (master + replica + 3-node Sentinel) stores all Write-Ahead Log entries independently of every service's business data. All Sentinel clusters use a **quorum of 2** (majority of 3), ensuring correct failover decisions and tolerance of a single Sentinel failure. The complete stack totals **30 containers**.
 
 ### Redis Architecture: State vs. Messaging
 
@@ -129,10 +128,10 @@ Every WAL entry in the system lives in a **dedicated `wal-redis` cluster** that 
 On startup, each `order-service` replica scans its WAL (`wal:order:saga:pending` or `wal:order:2pc:pending`) in `wal-redis`. If it finds transactions that were in-flight during a crash, it deterministically re-drives them. Each **orchestrator** replica scans `wal:orch:pending` in the same `wal-redis`, acquires distributed locks (`wal:orch:lock:{batch_id}`) to prevent duplicate processing, and re-dispatches any incomplete batches. All participant services are idempotent, so re-driving a batch that was partially completed is safe.
 
 ### Application Replica Failure
-Nginx upstream pools are configured with `max_fails=1 fail_timeout=5s` and `proxy_next_upstream error timeout http_500 http_502 http_503`. When one replica crashes, Nginx automatically retries the request on the healthy one. All containers use `restart: unless-stopped`.
+Nginx upstream pools are configured with `max_fails=1 fail_timeout=5s` and `proxy_next_upstream error http_502`. When one replica crashes (502 Bad Gateway), Nginx automatically retries the request on the healthy one. Retries are limited to connection errors and bad gateway responses to avoid re-dispatching requests that may already be in progress. All containers use `restart: unless-stopped`.
 
 ### Redis Master Failure (Sentinel Automatic Failover)
-Each service has a **Redis master + replica + Sentinel** cluster. Redis Sentinel monitors the master; if it fails, it triggers an automatic failover, promoting the replica to master in ~5–8 seconds. Application services use a Sentinel-aware client to discover the new master transparently.
+Each service has a **Redis master + replica + 3-node Sentinel** cluster with a quorum of 2. Redis Sentinel monitors the master; if it fails, 2 out of 3 sentinels must agree before triggering a failover, promoting the replica to master in ~5–8 seconds. This prevents split-brain scenarios and tolerates the loss of one sentinel node. Application services use a Sentinel-aware client configured with all 3 sentinel addresses for discovery redundancy.
 
 ### Concurrent Correctness (Optimistic Locking)
 All state mutations use Redis `WATCH/MULTI/EXEC` optimistic locking with up to 10 retry attempts. This prevents lost updates and inconsistent state under concurrent load.
@@ -155,6 +154,20 @@ Three compose files are provided targeting different CPU budgets. All expose the
 
 **Prerequisites:** Docker ≥ 24, Docker Compose v2.
 
+#### Testing - general docker compose setup
+Docker compose setup that is similar to "medium" and "large" configuration but with fewer resources such that it can be run on our laptops for testing.
+
+**Prerequisites:** For the tests you need to install pytest and requests:
+```bash
+pip install pytest requests
+```
+
+**Run tests** (using the default `docker-compose.yml`):
+```bash
+docker compose up --build
+bash test-scripts/run_all.sh
+```
+
 #### Small — single instance (~5 CPUs)
 One replica and one gunicorn worker per service, one orchestrator instance, standalone Redis per service (no Sentinel).
 
@@ -164,7 +177,7 @@ docker compose -f docker-compose-small.yml up --build
 ```
 
 #### Medium — 50 CPUs (hard limit)
-Four replicas per service (8 workers each, 3.5 CPU cap), 2 orchestrator replicas (1.4 CPU each), full Redis Sentinel HA for all services including orchestrator. Total hard limit: 49.9 CPUs.
+Four replicas per service (8 workers each, 3.4 CPU cap), 2 orchestrator replicas (1.4 CPU each), full Redis Sentinel HA (3 sentinels per cluster, quorum=2) for all services including WAL. Total hard limit: 49.5 CPUs.
 
 ```bash
 docker compose -f docker-compose-medium.yml down -v
@@ -172,46 +185,16 @@ docker compose -f docker-compose-medium.yml up --build
 ```
 
 #### Large — 90 CPUs (hard limit)
-Eight replicas per service (8 workers each, 3.1 CPU cap), 4 orchestrator replicas (1.5 CPU each), full Redis Sentinel HA for all services including orchestrator. Designed for a 96-core machine, leaving ~6 CPUs for locust clients. Total hard limit: 89.8 CPUs.
+Eight replicas per service (8 workers each, 3.0 CPU cap), 4 orchestrator replicas (1.5 CPU each), full Redis Sentinel HA (3 sentinels per cluster, quorum=2) for all services including WAL. Designed for a 96-core machine, leaving ~6 CPUs for locust clients. Total hard limit: 88.2 CPUs.
 
 ```bash
 docker compose -f docker-compose-large.yml down -v
 docker compose -f docker-compose-large.yml up --build
 ```
 
-**Run tests** (any tier):
-```bash
-bash test-scripts/run_all.sh
-```
-
-### Kubernetes — minikube (Local)
-
-**Prerequisites:** minikube, kubectl, docker.
-
-1.  **Start minikube:**
-    ```bash
-    minikube start
-    ```
-
-2.  **Deploy the stack:**
-    ```bash
-    bash deploy-charts-minikube.sh
-    ```
-    This builds the images into minikube's Docker daemon and applies all manifests in `k8s/` (Redis Sentinel clusters, gateway, and app services).
-
-3.  **Access the Gateway:**
-    In a separate terminal, forward the ingress port:
-    ```bash
-    kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80
-    ```
-    Then run tests targeting the minikube gateway:
-    ```bash
-    BASE_URL=http://localhost:8080 bash test-scripts/run_all.sh
-    ```
-
 ## Configuration
 
-Configuration is managed via environment variables in `docker-compose.yml` or K8s manifests.
+Configuration is managed via environment variables in `docker-compose.yml`.
 
 | Variable | Service | Description | Default |
 |----------|---------|-------------|---------|
@@ -254,6 +237,11 @@ Configuration is managed via environment variables in `docker-compose.yml` or K8
 | `12_orchestrator.sh` | Orchestrator integration tests: saga/2PC flows, concurrency, pause/resume, WAL recovery. |
 | `13_microservices_pytest.sh` | Python integration tests for stock, payment, and order service correctness. |
 | `14_wal_decoupled.sh` | Verifies WAL keys live only in `wal-redis` for all services and orchestrator; confirms WAL survives killing business-data Redis and both orchestrator containers. |
+| `15_fault_wal_redis_master.sh` | Kills the shared WAL Redis master; Sentinel promotes replica; checkouts resume after failover. |
+| `16_fault_mq_redis.sh` | Kills the MQ Redis broker; verifies services reconnect on restart and no ghost payments occur. |
+| `17_fault_kill_process.sh` | Kills PID 1 inside each container type (order, stock, payment, orchestrator) to test hard process failure recovery. |
+| `18_fault_sequential_kills.sh` | Kills containers one at a time with recovery between each; verifies stock and credit consistency throughout. |
+| `19_fault_orchestrator_under_load.sh` | Fires concurrent checkouts then kills the orchestrator mid-flight; verifies no money or stock is lost after WAL recovery. |
 
 ## Technology Stack
 
